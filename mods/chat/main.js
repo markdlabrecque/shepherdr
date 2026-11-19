@@ -31,7 +31,7 @@ import * as fs from "fs/promises";
 import { FIND, LOG, Conversation, records, resultText, summary, excerpt, names, pilotLine } from "./core/chat-log.js";
 import { BgJobs } from "./core/bg-jobs.js";
 import { ChatReader, kindOf } from "./core/chat-reader.js";
-import { piTarget, piSend, piRequestId, PI_UNAVAILABLE, PI_BLOCKED } from "./core/pi-chat.js";
+import { piTarget, piSend, piRequestId, piHistoryOf, samePiHistory, PI_UNAVAILABLE, PI_BLOCKED } from "./core/pi-chat.js";
 import { preview } from "./core/recipe.js";
 import { words, howAnswered, codexOnScreen, codexSteps } from "./core/asks.js";
 // The rows' words and rules the web app's chat draws by too (core/chat-view.js).
@@ -1169,7 +1169,7 @@ export default class Chat extends View {
       return;
     }
     this.piReader = null;
-    if (this.kind === "pi") { this.kind = null; this.reset(); this.set("finding", cx); }
+    if (this.kind === "pi") { this.recoverPiOutgoing(null, cx); this.kind = null; this.reset(); this.set("finding", cx); }
     this.loadFirst(cx, t.labels);
     this.argv = t.foreground?.argv ?? t.argv ?? null;
     const pid = t.foreground?.pid;
@@ -1249,6 +1249,23 @@ export default class Chat extends View {
     this.pending = this.pending.filter((p) => !users.some((u) => matches(u, p)));
   }
 
+  // Unlike a dropped socket, a different Pi history can't acknowledge the old sends. Keep the
+  // person's words and files as a draft, without their old quote and without sending anything.
+  recoverPiOutgoing(snapshot, cx) {
+    const history = piHistoryOf(snapshot);
+    if (this.piHistory && this.piHistory !== history) this.quote = null;
+    this.piHistory = history;
+    const belongs = (msg) => !msg?.piAddr || (msg.piAddr === this.addr && samePiHistory(msg.pi, snapshot));
+    const missed = [...this.pending.filter((p) => !belongs(p.msg)).map((p) => p.msg), ...this.queue.filter((m) => !belongs(m))];
+    if (!missed.length) return;
+    this.pending = this.pending.filter((p) => belongs(p.msg));
+    this.queue = this.queue.filter(belongs);
+    this.box.set_value([this.box.value(), ...missed.map((m) => m.text)].filter(Boolean).join("\n\n"));
+    this.files = [...this.files, ...missed.flatMap((m) => m.files ?? [])];
+    this.note = { id: `pi-draft-${Date.now()}`, text: "Pi changed conversations. Check the terminal before sending the restored draft." };
+    this.saveSoon(cx);
+  }
+
   // The newest page first; after that, what the log gained since.
   async pull(cx) {
     if (this.kind === "pi" && this.piReader?.addr === this.addr) {
@@ -1263,7 +1280,13 @@ export default class Chat extends View {
         this.anchor = null;
         this.pinned = this.stick = true;
       }
+      if (reader.pi) this.recoverPiOutgoing(reader.pi, cx);
       this.conv = reader.conv;
+      if (this.anchor) {
+        const id = this.anchor.id;
+        const final = this.conv?.items.find((x) => x.renderId && (x.renderId === id || id.startsWith(`${x.renderId}:`)));
+        if (final) this.anchor.id = final.id + id.slice(final.renderId.length);
+      }
       this.start = reader.start;
       this.settlePending();
       this.phase = reader.pi ? "ready" : "pi-unavailable";
@@ -1537,7 +1560,8 @@ export default class Chat extends View {
       paths: files.filter((f) => f.image).map((f) => f.path), at: Date.now(), sent: body,
       match: norm(msg.text).slice(0, 60) || null, msg };
     this.pending.push(p);
-    const isSamePi = () => this.kind === "pi" && addr === msg.piAddr && this.addr === addr && this.piReader?.pid === msg.pi?.pid;
+    const isSamePi = () => this.kind === "pi" && addr === msg.piAddr && this.addr === addr && this.piReader?.pid === msg.pi?.pid
+      && samePiHistory(msg.pi, this.piReader?.pi);
     if (kind === "pi" && (!wasPi || !msg.pi || !isSamePi())) {
       p.failed = wasPi && !msg.pi ? PI_UNAVAILABLE : "The terminal changed before this message could be sent. Open it before writing a new message.";
       p.noRetry = true;
@@ -1559,6 +1583,7 @@ export default class Chat extends View {
           : { code: 1, stderr: "Pi is no longer running in this terminal.", noRetry: true };
         r = await sendTyped(io, addr, kind, p.sent, SETTLE, !!msg.stuck);
         if (r.waiting) {
+          if (!this.pending.includes(p)) return; // a new Pi history already put the text back in the draft
           this.pending = this.pending.filter((x) => x !== p);
           this.queue.unshift(msg);
           this.saveSoon(cx);

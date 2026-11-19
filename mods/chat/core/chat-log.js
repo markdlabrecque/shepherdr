@@ -625,7 +625,7 @@ export function piConversation(items, { session, generation, state } = {}) {
     if (x.role === "user") { open.clear(); conv.user(id, { ...cleanUser(x.text), at }); }
     else if (x.role === "assistant" || x.role === "error") {
       if (x.text.trim()) conv.push({ kind: x.role === "error" ? "error" : "agent", id, at, text: x.text,
-        ...(x.provisional ? { provisional: true } : {}) });
+        ...(x.provisional ? { provisional: true } : {}), ...(x.from ? { renderId: prefix + x.from } : {}) });
     } else if (x.role === "tool") {
       const kind = { read: "read", edit: "edit", write: "edit", bash: "run", grep: "search", find: "search" };
       const step = { id, kind: Object.hasOwn(kind, x.text) ? kind[x.text] : "tool", line: `Used ${x.text || "a tool"}` };

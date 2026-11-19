@@ -7,7 +7,7 @@ import { Chats } from "./chats.ts";
 import { activity, Compat } from "./compat.ts";
 import type { Hub } from "./hub.ts";
 import { failedOf, forgetAll } from "./send-once.ts";
-import { PI_BLOCKED, PI_UNAVAILABLE, PI_UNCONFIRMED } from "../core/pi-chat.js";
+import { piHistoryOf, PI_BLOCKED, PI_CHAT_CHANGED, PI_UNAVAILABLE, PI_UNCONFIRMED } from "../core/pi-chat.js";
 
 const addr = "pi-remote/tpi";
 const snap = { ok: true, state: "idle", instance: "inst", session: "session", leaf: "r1",
@@ -73,7 +73,7 @@ test("read and send Pi chat on the qualified machine, with text only on stdin", 
     expect(chat).toMatchObject({ cli: "pi", blocked: PI_BLOCKED, agent: { kind: "pi", words: "Pi" } });
     expect(chat.messages.map((m) => m.at)).toEqual(snap.items.map((m) => m.at));
     expect(await Bun.file(getLog).text()).toBe(`get\n${addr}\n--json\n`);
-    const message = { type: "send", chat: `t:${addr}`, text: "/literal\n你好", cid: "pi-remote-1", human: true };
+    const message = { type: "send", chat: `t:${addr}`, text: "/literal\n你好", cid: "pi-remote-1", human: true, piHistory: piHistoryOf(snap) };
     expect(await act(h, message, compat)).toHaveProperty("ok", true);
     expect(requests).toEqual([{ instance: "inst", session: "session", leaf: "r1", id: "pi-remote-1", body: "/literal\n你好", mode: "now" }]);
     expect(notes[0]).toMatchObject([addr, { cid: "pi-remote-1", text: message.text }]);
@@ -145,10 +145,47 @@ test("web publishes Pi append, earlier, branch replacement and a revalidated rec
   } finally { chats.unwatch(addr, page); }
 });
 
+test("a new Pi subscriber cannot receive a poll already in flight for another tab", async () => {
+  const initial = { ...snap, generation: "initial", reset: true, before: 0, live: [] };
+  const replacement = { ...initial, generation: "replacement", leaf: "new" };
+  let count = 0;
+  let finish: ((snapshot: unknown) => void) | undefined;
+  const { h } = remote(() => ++count === 1 ? initial : count === 2 ? new Promise((resolve) => { finish = resolve; }) : replacement);
+  const chats = new Chats(h);
+  const old: string[] = [], joined: string[] = [];
+  const a = (r: any) => old.push(r.pi.generation);
+  const b = (r: any) => joined.push(r.pi.generation);
+  chats.watch(addr, a);
+  try {
+    await until(() => old.length && finish);
+    chats.watch(addr, b);
+    chats.refreshAll();
+    expect(joined).toEqual([]);
+    finish?.({ ...initial, reset: false, before: initial.items.length, items: [], state: "working" });
+    await until(() => joined.length);
+    expect(joined).toEqual(["replacement"]);
+  } finally { chats.unwatch(addr, a); chats.unwatch(addr, b); }
+});
+
+test("a quoted web send is bound to the Pi snapshot the person saw", async () => {
+  const original = { ...snap, generation: "old", session: "previous" };
+  let active = { ...snap, generation: "new", session: "replacement" };
+  const { h, compat, requests } = remote(() => active);
+  compat.reader = (() => ({ kind: "pi", pi: original, conv: { items: [{ id: "old-quote", text: "only on the previous branch" }] } })) as any;
+  const b = { type: "send", chat: `t:${addr}`, pi: true, reply: "old-quote", text: "response", piHistory: piHistoryOf(original) };
+  await expect(act(h, { ...b, cid: "cached-old-reply" }, compat)).rejects.toThrow(PI_CHAT_CHANGED);
+  await expect(act(h, { ...b, cid: "wrong-view-reply", piHistory: piHistoryOf(active) }, compat)).rejects.toThrow(PI_CHAT_CHANGED);
+  await expect(act(h, { ...b, cid: "unbound-reply", reply: undefined, piHistory: undefined }, compat)).rejects.toThrow(PI_CHAT_CHANGED);
+  expect(requests).toEqual([]);
+  active = original;
+  expect(await act(h, { ...b, cid: "correct-reply" }, compat)).toHaveProperty("ok", true);
+  expect(requests[0]).toMatchObject({ session: original.session, generation: original.generation, body: expect.stringContaining("only on the previous branch") });
+});
+
 test("held Pi send keeps its identity across polls and is not retried after a lost receipt", async () => {
   let sends = 0;
   const { h, compat, requests, notes } = remote(() => snap, () => ++sends === 1 ? { ok: true, status: "waiting" } : null);
-  const message = { type: "send", chat: `t:${addr}`, cid: "pi-held", text: "after the turn", hold: true, pi: true };
+  const message = { type: "send", chat: `t:${addr}`, cid: "pi-held", text: "after the turn", hold: true, pi: true, piHistory: piHistoryOf(snap) };
   expect(await act(h, message, compat)).toEqual({ ok: true, waiting: true, waitsFor: "turn" });
   await until(() => failedOf(addr).some((f) => f.cid === message.cid));
   expect(failedOf(addr)).toContainEqual({ cid: message.cid, error: PI_UNCONFIRMED, noRetry: true, ambiguous: true });
@@ -163,7 +200,7 @@ test("held Pi send keeps its identity across polls and is not retried after a lo
 test("Pi send refusals distinguish blocked, stale and missing", async () => {
   for (const [error, expected] of [["blocked", "Answer in the terminal"], ["stale_leaf", "changed branches"], ["not_available", PI_UNAVAILABLE]]) {
     const { h, compat, requests, notes } = remote(() => snap, () => ({ ok: false, error }));
-    const message = { type: "send", chat: `t:${addr}`, cid: `pi-${error}`, text: "hi" };
+    const message = { type: "send", chat: `t:${addr}`, cid: `pi-${error}`, text: "hi", piHistory: piHistoryOf(snap) };
     await expect(act(h, message, compat)).rejects.toThrow(expected);
     expect(requests).toHaveLength(1);
     expect(notes).toEqual([]);

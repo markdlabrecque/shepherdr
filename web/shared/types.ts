@@ -562,6 +562,8 @@ export interface Message {
   updated?: number
   /** Pi is still streaming this text. It has no persisted message actions yet. */
   provisional?: boolean
+  /** Stable visual key shared with the draft a finalized Pi record replaces. */
+  renderId?: string
   /** plain text (yours) or markdown (the agent's) */
   text?: string
   /** "Answered “Rerun CI on main?”" */
@@ -868,6 +870,8 @@ export interface Chat {
   earlier?: boolean
   /** Changes when Pi history is replaced, so old page and tool requests cannot affect this view. */
   piView?: string
+  /** The Pi instance and branch a send or pending message belongs to. */
+  piHistory?: string
   /** Pi's oldest loaded position, which can change without adding a visible row. */
   piBefore?: number
   /** 3.0's working line over the box: what it does now (empty: "Working"); waits: only waiting (a clock, no spinner) */
@@ -1261,7 +1265,7 @@ export type Action =
   /** cid: the screen's own id for what it sent, which comes back on the message (Message.cid); reply: the id of the
       message it answers; human: said in the app itself, the only kind of message that can take back a merge yes. Scripts
       leave it off */
-  | { type: 'send'; chat: string; text: string; attachments?: string[]; cid?: string; reply?: string; human?: boolean; hold?: boolean; pi?: boolean }
+  | { type: 'send'; chat: string; text: string; attachments?: string[]; cid?: string; reply?: string; human?: boolean; hold?: boolean; pi?: boolean; piHistory?: string }
   | { type: 'react'; chat: string; message: string; emoji: string }
   /** a secret kept at a level (all, m:<machine>, p:<machine>:<space>), or removed (null); kept on the main machine, so
       it names no chat or place to be passed on by. card: the agent's ask it answers, told once it is kept */

@@ -7,7 +7,7 @@ const { typing: slashTyping, match: slashMatch } = SL as any
 import { openAccept } from '@client/screens/Accept.tsx'
 import { Component, createContext, Fragment, memo, useContext, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ComponentType, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type RefObject } from 'react'
 import { act, chatName, definePlugin, getDraft, getState, goChat, has, holdReload, openArtifact, openItem, openNeeds, openTask, registry, setDraft, setOutbox, setUI, taskOf, useDraft, useSnap, useStore, useUI, type UI } from '@client/kernel.ts'
-import { anchorOf, keyOf, partsOf, placesOf, priorOf, reasonOf, SEND_TIMEOUT, unconfirmedPi, type Outgoing } from '@client/outbox.ts'
+import { anchorOf, keyOf, partsOf, placesOf, priorOf, reasonOf, sameOutgoingHistory, SEND_TIMEOUT, unconfirmedPi, type Outgoing } from '@client/outbox.ts'
 import { dropFiles, keepFile, keptFile, postFile, retrying, sweepFiles, transient, HttpError } from '@client/uploads.ts'
 import { AlertIcon, BackIcon, CameraIcon, CheckIcon, CopyIcon, Count, DeleteIcon, dimmed, Dot, DownIcon, DownloadIcon, Empty, field, FileIcon, ic, IconButton, KeyIcon, LinkButton, LiveWave, MachineIcon, Menu, MenuItem, MenuSeparator, MenuSetting, MicIcon, ModeIcon, MoreIcon, NextIcon, PageIcon, PlanIcon, PlusIcon, Primary, QuestionIcon, ReplyIcon, RestartIcon, roundBtn, SearchIcon, SecretField, Sent, SmileIcon, Tab, Tabs, TextBox, UpIcon, useElapsed, XIcon } from '@client/ui.tsx'
 import { canDictate, dictate, dictSample, type Dictation } from '@client/dictation.ts'
@@ -243,11 +243,12 @@ const heldOut = (o: Outgoing) => o.state !== 'failed' && (o.hold || o.waitsFor =
 function Held({ chatKey }: { chatKey: string }) {
   const pi = useStore((s) => s.chats[chatKey]?.cli === 'pi')
   const piBlocked = useStore((s) => s.chats[chatKey]?.cli === 'pi' && s.chats[chatKey]?.blocked !== undefined)
-  const msgs = useStore((s) => s.chats[chatKey]?.messages)
+  const chat = useStore((s) => s.chats[chatKey])
+  const msgs = chat?.messages
   const outbox = useStore((s) => s.outbox)
   const rows = new Map<string, { cid: string; text: string; files: string[] }>()
   for (const m of msgs ?? []) if (isHeld(m)) rows.set(m.cid!, { cid: m.cid!, text: m.text ?? '', files: m.file ? [m.file.name] : [] })
-  for (const o of outbox) if (o.chat === chatKey && heldOut(o) && !rows.has(o.cid)) rows.set(o.cid, { cid: o.cid, text: o.text, files: o.files.map((f) => f.name) })
+  for (const o of outbox) if (o.chat === chatKey && sameOutgoingHistory(o, chat) && heldOut(o) && !rows.has(o.cid)) rows.set(o.cid, { cid: o.cid, text: o.text, files: o.files.map((f) => f.name) })
   if (!rows.size) return null
   const ghost = 'flex h-[22px] shrink-0 items-center rounded-[6px] px-2 text-[0.75rem] font-medium text-fg2 hover:bg-hover hover:text-fg phone:h-9'
   const take = (cid: string, then?: () => void) => {
@@ -1217,7 +1218,7 @@ const Messages = memo(function Messages({ chat, from }: { chat: Chat; from: stri
   // what you just sent, in one list with the rest: right after what was last when you sent it, so newer messages come
   // under it and the chat keeps the order things were sent in (SHEP-93: one stuck at the bottom under everything
   // newer). When it comes back it keeps its place in the list, so nothing is drawn again (a picture doesn't load twice)
-  const mine = outbox.filter((o) => o.chat === chat.key && !heldOut(o))
+  const mine = outbox.filter((o) => o.chat === chat.key && sameOutgoingHistory(o, chat) && !heldOut(o))
   const places = placesOf(shown.map((it) => ('msg' in it ? { id: it.msg.id, cid: it.msg.cid } : { id: '' })), mine)
   const extra = new Map<number, Item[]>()
   for (const out of mine) {
@@ -1840,7 +1841,8 @@ async function deliver(cid: string) {
     const release = holdReload()
     let r: { ok?: boolean; waiting?: boolean; waitsFor?: Outgoing['waitsFor']; at?: number }
     const pi = !!o.pi || getState().chats[o.chat]?.cli === 'pi'
-    const send = () => act({ type: 'send', chat: o.chat, text: o.text, attachments: files.map((f) => f.path), cid, reply: o.reply?.id, human: true, hold: o.hold, pi: pi || undefined }, AbortSignal.timeout(SEND_TIMEOUT))
+    const send = () => act({ type: 'send', chat: o.chat, text: o.text, attachments: files.map((f) => f.path), cid, reply: o.reply?.id,
+      human: true, hold: o.hold, pi: pi || undefined, piHistory: o.piHistory }, AbortSignal.timeout(SEND_TIMEOUT))
     try {
       if (pi) {
         patch(() => ({ pi: true, piInFlight: true }))
@@ -1877,7 +1879,7 @@ const newCid = () => `${Date.now().toString(36)}-${Math.random().toString(36).sl
 function retry(cid: string) {
   const s = getState()
   const o = s.outbox.find((x) => x.cid === cid)
-  if (!o || o.noRetry) return
+  if (!o || o.noRetry || !sameOutgoingHistory(o, s.chats[o.chat])) return
   const again: Outgoing = { ...o, cid: o.lost ? newCid() : o.cid, state: 'sending', error: undefined, lost: undefined, waiting: undefined, waitsFor: undefined, queued: undefined, serverAt: undefined, wentAt: undefined, busyAt: undefined, pastAt: undefined, offline: undefined, up: undefined, at: Date.now(), prior: priorOf(s.chats[o.chat]), after: anchorOf(s.chats[o.chat]), before: s.outbox.filter((x) => x.chat === o.chat && x.cid !== cid).map((x) => x.cid) }
   setOutbox((all) => all.map((x) => (x.cid === cid ? again : x)))
   void deliver(again.cid)
@@ -2017,8 +2019,9 @@ function Composer({ chatKey, placeholder, cli, suggest = null }: { chatKey: stri
   useEffect(() => setMsel(0), [word, (MNc as any).typingTask(text) === null])
   const takeMention = (i: Item) => { setText(takeItem(chatKey, text, i)); ref.current?.focus() }
   const piBlocked = useStore((s) => cli === 'pi' && s.chats[chatKey]?.blocked !== undefined)
+  const piHistory = useStore((s) => s.chats[chatKey]?.piHistory)
   const send = (hold = false, words = text) => {
-    if (!hold && piBlocked) return
+    if ((!hold && piBlocked) || (cli === 'pi' && !piHistory)) return
     const t = expandPicked(chatKey, words.trim())
     if (!t && !files.length) return
     recall.current = -1
@@ -2050,7 +2053,7 @@ function Composer({ chatKey, placeholder, cli, suggest = null }: { chatKey: stri
       after: anchorOf(getState().chats[chatKey]),
       before: getState().outbox.filter((o) => o.chat === chatKey).map((o) => o.cid),
       ...(hold ? { hold: true } : {}),
-      ...(cli === 'pi' ? { pi: true } : {}),
+      ...(cli === 'pi' ? { pi: true, piHistory } : {}),
     }
     setOutbox((all) => [...all, out])
     void deliver(out.cid)
@@ -2221,10 +2224,33 @@ function Composer({ chatKey, placeholder, cli, suggest = null }: { chatKey: stri
 
 const noFiles: { name: string; path?: string }[] = []
 
+function PreviousPiSends({ chatKey }: { chatKey: string }) {
+  const chat = useStore((s) => s.chats[chatKey])
+  const outbox = useStore((s) => s.outbox)
+  const previous = chat && !chat.notice ? outbox.filter((o) => o.chat === chatKey && o.pi && !sameOutgoingHistory(o, chat)) : []
+  if (!previous.length) return null
+  const restore = (o: Outgoing) => {
+    setDraft(chatKey, [getDraft(chatKey), o.text].filter(Boolean).join('\n\n'))
+    setUI((u) => {
+      const { [chatKey]: _, ...reply } = u.reply
+      return { reply, files: { ...u.files, [chatKey]: [...(u.files[chatKey] ?? []), ...o.files] }, focus: chatKey }
+    })
+    removeOut(o.cid)
+  }
+  return <details className="rounded-row bg-well px-3 py-2 text-[0.75rem] text-fg2">
+    <summary className="cursor-pointer">Messages from a previous Pi conversation</summary>
+    <p className="py-1 text-fg3">Check the terminal before sending these again.</p>
+    {previous.map((o) => <div key={o.cid} className="flex items-center justify-between gap-2 py-1">
+      <span className="truncate">{o.text || o.files.map((f) => f.name).join(', ')}</span>
+      <LinkButton onClick={() => restore(o)}>Edit as draft</LinkButton>
+    </div>)}
+  </details>
+}
+
 // What sits round the message box but not its words (what shows over it, the model menu, the mic) is drawn again only
 // when its own bits change, not on each letter typed (#631)
 const ComposerAbove = memo(function ComposerAbove({ chatKey, cli }: { chatKey: string; cli: string }) {
-  return registry.composerAbove.map(({ View }, i) => <View key={i} chatKey={chatKey} cli={cli} />)
+  return <><PreviousPiSends chatKey={chatKey} />{registry.composerAbove.map(({ View }, i) => <View key={i} chatKey={chatKey} cli={cli} />)}</>
 })
 const AgentLineKept = memo(AgentLine)
 const MicKept = memo(function MicKept({ chatKey }: { chatKey: string }) {

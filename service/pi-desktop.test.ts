@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { ChatReader } from "../core/chat-reader.js";
-import { piSend, piTarget, PI_BLOCKED, PI_UNCONFIRMED, PI_UNAVAILABLE } from "../core/pi-chat.js";
+import { piSend, piTarget, piHistoryOf, samePiHistory, PI_BLOCKED, PI_UNCONFIRMED, PI_UNAVAILABLE } from "../core/pi-chat.js";
 import { messageBody, refusal, sendTyped } from "../core/send.js";
 
 // Run the actual window methods without starting herdr-app or loading its settings.
@@ -21,7 +21,7 @@ test("the window pulls a qualified Pi snapshot and uses its status, not the term
   const reader = new ChatReader({ sh: async (...args: unknown[]) => { calls.push(args); return answer; } }, addr);
   await reader.locate({ state: "live", foreground: { name: "pi", pid: 77 } });
   const changed: number[] = [];
-  const self = { addr, kind: "pi", piReader: reader, conv: null as any, phase: "finding", results: new Map(), opened: new Set(), settlePending() {} };
+  const self = { addr, kind: "pi", piReader: reader, conv: null as any, phase: "finding", results: new Map(), opened: new Set(), settlePending() {}, recoverPiOutgoing() {} };
   const pull = method("pull", { PI_UNAVAILABLE });
   await pull.call(self, { notify: () => changed.push(1) });
   expect(calls[0].slice(1)).toEqual([["pi-chat", "snapshot", "77"], "desktop-remote"]);
@@ -49,7 +49,7 @@ test("desktop paging keeps its anchor and drops a tool response from the previou
   await reader.locate({ state: "live", foreground: { name: "pi", pid: 77 } });
   const jobs: Promise<unknown>[] = [];
   const cx = { notify() {}, spawn: (fn: Function) => jobs.push(fn(cx)) };
-  const self: any = { addr, kind: "pi", piReader: reader, results: new Map(), opened: new Set(),
+  const self: any = { addr, kind: "pi", piReader: reader, results: new Map(), opened: new Set(), recoverPiOutgoing() {},
     rows: () => [{ id: "top" }, ...reader.conv!.items],
     settlePending() {}, loadResults: method("loadResults", { KEEP: 2000 }) };
   const pull = method("pull");
@@ -83,7 +83,7 @@ test("desktop held sends keep the old leaf; Send now steers and an unconfirmed s
     addr, kind: "pi", machine: "desktop-remote", phase: "ready", piReader: { pid: 77, pi: snapshot },
     queue: [], pending: [], asks: [{ stale: true }], status: () => "idle", saveSoon() {}, taskTags: () => "", sendIo: () => ({}),
     piExec: async (_: string, args: string[], on: string, input: string) => { sent.push({ args, on, ...JSON.parse(input) }); return answer; },
-    deliver: method("deliver", { messageBody, refusal, sendTyped, piSend, PI_UNAVAILABLE,
+    deliver: method("deliver", { messageBody, refusal, sendTyped, piSend, samePiHistory, PI_UNAVAILABLE,
       attach: { deliver: async () => [] }, norm: (s: string) => s, SETTLE: null,
       openCard: () => { throw new Error("Pi does not use Claude or Codex's cards"); } }),
   };
@@ -108,6 +108,20 @@ test("desktop held sends keep the old leaf; Send now steers and an unconfirmed s
   self.deliver(msg, cx);
   expect(jobs).toHaveLength(0);
   expect(self.pending[1]).toMatchObject({ failed: expect.stringContaining("terminal changed"), noRetry: true });
+});
+
+test("desktop restores outgoing messages from another Pi branch as a draft without the quote", () => {
+  const old = { ...snapshot, generation: "original" }, current = { ...snapshot, generation: "fork" };
+  const message = (text: string, target = old) => ({ text, piAddr: addr, pi: piTarget(77, target), files: [] });
+  let draft = "existing draft";
+  const self = { addr, piHistory: piHistoryOf(old), pending: [{ msg: message("previous send") }],
+    queue: [message("previous hold"), message("this branch only", current)], quote: { id: "old quote" }, files: [],
+    box: { value: () => draft, set_value: (text: string) => { draft = text; } }, saveSoon() {} };
+  method("recoverPiOutgoing", { piHistoryOf, samePiHistory }).call(self, current, {});
+  expect(self.pending).toEqual([]);
+  expect(self.queue.map((m) => m.text)).toEqual(["this branch only"]);
+  expect(self.quote).toBeNull();
+  expect(draft).toBe("existing draft\n\nprevious send\n\nprevious hold");
 });
 
 test("blocked desktop keeps a draft and Pi-only controls cannot trigger another CLI", () => {

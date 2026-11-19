@@ -8,7 +8,7 @@ import type { Snapshot, Place, Task, Need, Section, Machine, Chat, Message, Stat
 import * as T from "../core/tasks.js";
 import * as SPc from "../core/spaces.js";
 import { kindOf as kindOfTerm } from "../core/chat-reader.js";
-import { PI_BLOCKED } from "../core/pi-chat.js";
+import { PI_BLOCKED, piHistoryOf } from "../core/pi-chat.js";
 import * as CL from "../core/chat-log.js";
 import * as CV from "../core/chat-view.js";
 import { taskArtifacts } from "../core/task-artifacts.js";
@@ -65,7 +65,7 @@ export const newsKey = (rows: Row[]) => JSON.stringify(rows.filter((r) => r.spac
 
 // a news event's dot: what the task was at that moment
 const NEWS: Record<string, TaskStatus> = { added: "todo", queued: "queued", started: "work", needs: "need", asks: "need", stalled: "need", failed: "need", ready: "ready", merging: "merging", merged: "done", done: "done", closed: "done" };
-type Sent = { cid: string; text: string; files: string[]; at: number; piGeneration?: string };
+type Sent = { cid: string; text: string; files: string[]; at: number; piHistory?: string };
 const said = (v: string) => v.replace(/\s+/g, " ").trim();
 const base = (p: string) => p.split("/").pop() ?? p;
 
@@ -546,7 +546,8 @@ export class Compat {
     const mentionable = this.tasksFor(key);
     const own = this.chats.get(key);
     // what pages sent it, known again in the log: the page's id comes back on it
-    const sends = ((own && this.sends.get(own)) || []).filter((s) => s.piGeneration === reader.pi?.generation);
+    const history = piHistoryOf(reader.pi) ?? undefined;
+    const sends = ((own && this.sends.get(own)) || []).filter((s) => s.piHistory === history);
     const takenSends = new Set<string>();
     // A Pi terminal can move to a new tree without changing address. Only its current visible rows can name files.
     if (reader.kind === "pi") this.files.delete(key);
@@ -609,7 +610,8 @@ export class Compat {
         const md = (x.provisional ? { text: x.text, media: [] } : (CV as any).mediaIn(x.text, { cwd: t?.foreground?.cwd ?? t?.cwd ?? null, home: machine ? null : HOME })) as { text: string; media: { path: string; name: string; alt: string }[] };
         // the suggested next message it ends with (SHEP-186): the box shows it greyed out while nothing is typed
         if (md.text || !md.media.length) messages.push({ id: x.id, who: "agent", text: md.text || x.text, at: x.at, ...reactions,
-          ...(x.provisional ? { provisional: true } : {}), ...(x.suggest ? { suggest: x.suggest } : {}) });
+          ...(x.provisional ? { provisional: true } : {}), ...(x.renderId ? { renderId: x.renderId } : {}),
+          ...(x.suggest ? { suggest: x.suggest } : {}) });
         for (const [n, m] of md.media.entries()) {
           (this.files.get(key) ?? this.files.set(key, new Set()).get(key)!).add(m.path);
           messages.push({ id: `${x.id}:m${n}`, who: "agent", at: x.at, file: { name: m.name, path: m.path, ...(m.alt ? { alt: m.alt } : {}) }, ...(md.text || n ? {} : reactions) } as Message);
@@ -723,7 +725,8 @@ export class Compat {
       : reader.state === "none" || reader.state === "missing" ? ((t && t.state !== "live") || !t ? "ended" : kind ? "none" : "unsupported")
       : !reader.pinned && (!t || t.state !== "live") && !items.length ? "ended" : null;
     const failed = failedOf(addr);
-    const piHistory = reader.piView ? { piView: reader.piView, ...(reader.start != null ? { piBefore: reader.start } : {}) } : {};
+    const piHistory = reader.piView ? { piView: reader.piView, piHistory: history,
+      ...(reader.start != null ? { piBefore: reader.start } : {}) } : {};
     return { key, messages, ...piHistory, ...(failed.length ? { failed } : {}), ...head, ...under, ...(note ? { note } : {}), ...(notice ? { notice } : {}), ...(agent ? { agent } : {}), ...(jobs.length ? { jobs } : {}), working: st === "working", cli: pi ? "pi" : reader.kind === "codex" ? "codex" : "claude", ...(reader.pinned || (t && t.state !== "live") ? { finished: true } : {}) };
   }
 }

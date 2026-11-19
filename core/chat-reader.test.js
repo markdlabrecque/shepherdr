@@ -64,12 +64,13 @@ test("Pi append and streaming keep loaded earlier pages; final records replace l
   const liveId = reader.conv.items.at(-1).id;
   await pull(snap({ state: "working", reset: false, before: 2, live: [row("live:a:0", "more words")] }));
   expect(reader.conv.items.at(-1).id).toBe(liveId);
-  const final = snap({ leaf: "done", reset: false, before: 2, items: [row("done:0", "same text")] });
+  const final = snap({ leaf: "done", reset: false, before: 2, items: [{ ...row("done:0", "same text"), from: "live:a:0" }] });
   expect(await pull(final)).toBeTrue();
   expect(await pull({ ...final, before: 3, items: [] })).toBeFalse();
   expect(texts(reader)).toEqual(["older", "same text", "same text"]);
   expect(reader.conv.items[1].id).toBe(initial);
   expect(reader.conv.items.at(-1).id).not.toBe(liveId);
+  expect(reader.conv.items.at(-1).renderId).toBe(liveId);
   expect(reader.piView).toBe(view);
 });
 

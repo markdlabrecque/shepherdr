@@ -16,6 +16,14 @@ test('a Pi send without a receipt keeps its words and no Retry, even after expir
     .toMatchObject({ state: 'failed', error: 'Pi changed branches.', noRetry: true, ambiguous: undefined })
 })
 
+test('a pending Pi send is recoverable but never displayed or settled on a different branch', () => {
+  const o = sent({ pi: true, piHistory: 'viewed', prior: ['old'] })
+  const replacement: Chat = { ...chat([{ id: 'renamed-old', who: 'you', text: 'cool', at: 10_800 }]), cli: 'pi', piHistory: 'replacement' }
+  expect(partsOf(o, replacement)).toEqual([])
+  expect(settle([o], replacement)).toEqual([o])
+  expect(settle([o], { ...replacement, piHistory: 'viewed', messages: [{ id: 'new', who: 'you', text: 'cool', cid: o.cid }] })).toEqual([])
+})
+
 test('the real message takes its place', () => {
   expect(settle([sent()], chat([{ id: 'old', who: 'you', text: 'cool', at: 1 }, { id: 'u2', who: 'you', text: 'cool', at: 10_800 }]))).toEqual([])
 })

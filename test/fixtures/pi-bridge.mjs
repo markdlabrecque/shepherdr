@@ -90,7 +90,9 @@ for await (const line of createInterface({ input: process.stdin })) {
   }
   if (action === "final") {
     const record = message("final", "assistant", [{ type: "thinking", thinking: "final secret" }, text(value)]);
-    await emit("message_end", { message: record.message });
+    // Another extension handed the hook a replacement object, but Pi writes the original
+    // object with the replacement content. No turn_end arrives yet (a tool could still run).
+    await emit("message_end", { message: structuredClone(record.message) });
     append(record);
     live = undefined;
   }

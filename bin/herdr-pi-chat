@@ -130,6 +130,10 @@ def visible_items(items, roles):
             if type(item["part"]) is not int or not 0 <= item["part"] < 2**53:
                 raise Failure("invalid_response")
             visible["part"] = item["part"]
+        if "from" in item:
+            if item["role"] != "assistant" or not token(item["from"]) or not item["from"].startswith("live:"):
+                raise Failure("invalid_response")
+            visible["from"] = item["from"]
         out.append(visible)
     return out
 

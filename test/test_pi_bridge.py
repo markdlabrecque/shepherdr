@@ -277,6 +277,8 @@ class Bridge(Scratch):
         settled = self.cli("snapshot", self.cursor(more))
         self.assertEqual(settled["live"], [])
         self.assertEqual([(i["id"], i["text"]) for i in settled["items"]], [("final:1", "authoritative final words")])
+        self.assertEqual(settled["items"][0]["from"], more["live"][0]["id"])
+        self.assertEqual(self.cli("snapshot")["items"][-1]["from"], more["live"][0]["id"])
         self.control("tool-calls")
         tools = self.cli("snapshot", self.cursor(settled))
         self.assertEqual([(i["id"], i["text"]) for i in tools["items"]], [("calls:0", "read"), ("calls:1", "extension_tool")])

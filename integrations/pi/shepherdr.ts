@@ -60,7 +60,7 @@ type Entry = ReturnType<ExtensionContext["sessionManager"]["getBranch"]>[number]
 type ChatMessage = Extract<Entry, { type: "message" }>["message"];
 type Assistant = Extract<ChatMessage, { role: "assistant" }>;
 type Row = { id: string; role: "user" | "assistant" | "custom" | "compaction" | "branch" | "tool" | "result";
-  text: string; at: number; part?: number };
+  text: string; at: number; part?: number; from?: string };
 
 // Index the raw branch, not Pi's model projection: compaction and context edits must not erase chat.
 // Tool output stays in Pi's records. The snapshot carries a call's label, not its arguments or result.
@@ -113,11 +113,14 @@ function indexBranch(branch: Entry[]) {
   return { rows, positions, results, failed };
 }
 
-function page(rows: Row[], before: number, floor = 0, max = PAGE_BYTES) {
+function page(rows: Row[], before: number, floor = 0, max = PAGE_BYTES, aliases?: Map<string, string>) {
   const items: Row[] = [];
   let bytes = 0;
   while (before > floor && items.length < PAGE_ROWS) {
-    const item = rows[before - 1];
+    const row = rows[before - 1];
+    const sep = row.id.lastIndexOf(":");
+    const alias = row.role === "assistant" && aliases?.get(row.id.slice(0, sep));
+    const item = alias ? { ...row, from: `live:${alias}:${row.id.slice(sep + 1)}` } : row;
     const size = Buffer.byteLength(JSON.stringify(item)) + 1;
     if (bytes + size > max) break;
     before--;
@@ -165,13 +168,23 @@ export default function (pi: ExtensionAPI) {
   let stop: (() => Promise<void>) | undefined;
   let blocked = false;
   let revision: (() => void) | undefined;
-  let live: { id: string; manager: ExtensionContext["sessionManager"]; session: string; leaf: string | null;
-    message: Assistant; final?: Assistant } | undefined;
+  type Stream = { id: string; manager: ExtensionContext["sessionManager"]; session: string; leaf: string | null };
+  let live: (Stream & { message: Assistant }) | undefined;
+  let ended: Stream[] = [];
+  const clearLive = () => { live = undefined; ended = []; };
+  const finishLive = () => {
+    if (!live) return;
+    const { id, manager, session, leaf } = live;
+    ended = [...ended.slice(-19), { id, manager, session, leaf }];
+    live = undefined;
+  };
   pi.on("ui_prompt_start", () => { blocked = true; });
   pi.on("ui_prompt_end", () => { blocked = false; });
   pi.on("session_tree", () => { revision?.(); });
   pi.on("message_start", ({ message }, ctx) => {
-    if (message.role === "assistant") live = { id: randomUUID(), manager: ctx.sessionManager,
+    if (message.role !== "assistant") return;
+    finishLive();
+    live = { id: randomUUID(), manager: ctx.sessionManager,
       session: ctx.sessionManager.getSessionId(), leaf: ctx.sessionManager.getLeafId() ?? null, message };
   });
   pi.on("message_update", ({ message }, ctx) => {
@@ -180,13 +193,8 @@ export default function (pi: ExtensionAPI) {
     else live = { id: randomUUID(), manager: ctx.sessionManager, session: ctx.sessionManager.getSessionId(),
       leaf: ctx.sessionManager.getLeafId() ?? null, message };
   });
-  // Pi persists the message object after these handlers. Keep its identity, not the text
-  // passed to this event: other extensions can still replace the final content in place.
-  pi.on("message_end", ({ message }) => {
-    if (live && message.role === "assistant") live.final = message;
-  });
-  pi.on("turn_end", () => { live = undefined; });
-  pi.on("agent_end", () => { live = undefined; });
+  pi.on("turn_end", finishLive);
+  pi.on("agent_end", finishLive);
   pi.on("session_shutdown", async () => { await stop?.(); });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -208,8 +216,9 @@ export default function (pi: ExtensionAPI) {
     let stamp: ReturnType<typeof fileStamp> | undefined;
     let branch: Entry[] = [];
     let index = indexBranch(branch);
+    const aliases = new Map<string, string>();
     let refresh = true;
-    revision = () => { generation = randomUUID(); refresh = true; live = undefined; };
+    revision = () => { generation = randomUUID(); refresh = true; clearLive(); aliases.clear(); };
     function current() {
       const session = manager.getSessionId();
       const leaf = manager.getLeafId() ?? null;
@@ -231,6 +240,26 @@ export default function (pi: ExtensionAPI) {
       lastSession = session;
       lastPath = path;
       lastLeaf = leaf;
+      // The first assistant record after the stream's base is authoritative. Pi can persist a
+      // different object if another message_end handler rewrites the response, so don't compare
+      // object identities or text. Keep an alias per entry for rendering its same-index blocks.
+      const reconcile = (stream: Stream) => {
+        if (stream.manager !== manager || stream.session !== session) return true;
+        const from = stream.leaf === null ? 0 : branch.findIndex((e) => e.id === stream.leaf) + 1;
+        if (stream.leaf !== null && !from) return true;
+        for (let i = from; i < branch.length; i++) {
+          const entry = branch[i];
+          if (entry.type !== "message") continue;
+          if (entry.message.role === "user") return true;
+          if (entry.message.role !== "assistant") continue;
+          aliases.set(entry.id, stream.id);
+          if (aliases.size > 200) aliases.delete(aliases.keys().next().value!);
+          return true;
+        }
+        return false;
+      };
+      ended = ended.filter((stream) => !reconcile(stream));
+      if (live && reconcile(live)) live = undefined;
       return { instance, session, leaf, generation };
     }
 
@@ -244,23 +273,19 @@ export default function (pi: ExtensionAPI) {
         const state = blocked ? "blocked" : !ctx.isIdle() ? "working" : !ctx.model || index.failed ? "error" : "idle";
         const floor = request.generation !== generation ? undefined : request.leaf === null ? 0 :
           typeof request.leaf === "string" ? index.positions.get(request.leaf) : undefined;
-        const delta = floor === undefined ? undefined : page(index.rows, index.rows.length, floor);
+        const delta = floor === undefined ? undefined : page(index.rows, index.rows.length, floor, PAGE_BYTES, aliases);
         const reset = !delta || delta.before !== floor;
         // An append beyond the bounded delta window expires the cursor. Return a fresh page instead.
-        const result = reset ? page(index.rows, index.rows.length) : delta;
+        const result = reset ? page(index.rows, index.rows.length, 0, PAGE_BYTES, aliases) : delta;
         let overlay: Row[] = [];
         if (live && live.manager === manager && live.session === session && (state === "working" || state === "blocked")) {
-          const { id, message, final, leaf: base } = live;
-          const from = base === null ? 0 : branch.findIndex((e) => e.id === base) + 1;
-          // The new branch may already contain the final record before Pi calls turn_end.
-          if ((base !== null && !from) || branch.slice(from).some((e) => e.type === "message" &&
-            (e.message === final || (!final && e.message.role === "assistant")))) live = undefined;
-          else if (Array.isArray(message.content)) {
+          const { id, message } = live;
+          if (Array.isArray(message.content)) {
             const rows = message.content.flatMap((p, i): Row[] => p.type === "text" && p.text.trim() ?
               [{ id: `live:${id}:${i}`, role: "assistant", text: cleanText(p.text, 4000), at: message.timestamp }] : []);
             overlay = page(rows, rows.length, 0, LIVE_BYTES).items;
           }
-        } else live = undefined;
+        } else finishLive();
         return { ok: true, ...identity, state, reset, ...result, live: overlay };
       }
       if (request.op === "page" || request.op === "results") {
@@ -268,7 +293,7 @@ export default function (pi: ExtensionAPI) {
         if (request.op === "page") {
           const before = request.before;
           if (typeof before !== "number" || !Number.isSafeInteger(before) || before < 1 || before > index.rows.length) return error("stale_revision");
-          return { ok: true, ...identity, ...page(index.rows, before) };
+          return { ok: true, ...identity, ...page(index.rows, before, 0, PAGE_BYTES, aliases) };
         }
         if (!Array.isArray(request.ids) || request.ids.length > RESULT_LIMIT || !request.ids.every(token)) return error("invalid_request");
         const outputs = request.ids.flatMap((id: string) => {
@@ -351,7 +376,7 @@ export default function (pi: ExtensionAPI) {
       if (stop !== cleanup) return;
       stop = undefined;
       revision = undefined;
-      live = undefined;
+      clearLive();
       for (const socket of sockets) socket.destroy();
       try { unlink(registry); }
       finally {

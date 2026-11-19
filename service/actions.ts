@@ -23,7 +23,7 @@ import { execTemplate } from "./spaces.ts";
 import * as MA from "../core/machine-add.js";
 import { exec, sh } from "./model.ts";
 import { withForeground } from "./chats.ts";
-import { piSnapshot, piTarget, piSend, piRequestId, PI_UNAVAILABLE } from "../core/pi-chat.js";
+import { piSnapshot, piTarget, piSend, piRequestId, piHistoryOf, PI_CHAT_CHANGED, PI_UNAVAILABLE } from "../core/pi-chat.js";
 import { closeSaved, renameSaved, orderSaved, withoutSpace, splitId } from "./saved-spaces.ts";
 
 // The window's own space log (lib/spacelog.js): a space the service closed or renamed with no window is traced there too
@@ -56,6 +56,16 @@ async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
   // never some of them quietly
   if (sent.length > MAX_FILES) throw new Error(`At most ${MAX_FILES} files in one message.`);
   for (const p of sent) if (typeof p !== "string" || !p.startsWith(attachDir() + "/") || p.includes("/../")) throw new Error("That file isn't one sent from here.");
+  const terminal = await withForeground(a, t);
+  const cli = kindOf(terminal);
+  if ((b.pi === true || b.piHistory) && cli !== "pi") throw sendError(PI_CHAT_CHANGED, true);
+  const pid = terminal?.foreground?.pid;
+  const snapshot = cli === "pi" ? await piSnapshot((script: string, args: string[], on: string | null) => sh(hub, script, args, on), a, pid) : null;
+  const target = piTarget(pid, snapshot);
+  if (cli === "pi") {
+    if (!target) throw sendError(PI_UNAVAILABLE, true);
+    if (b.piHistory !== piHistoryOf(snapshot)) throw sendError(PI_CHAT_CHANGED, true);
+  }
   // all at once
   const files = await Promise.all(sent.map(async (p) => {
     if (!a.includes("/")) return p;
@@ -66,16 +76,9 @@ async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
     return landed;
   }));
   const body = [messageBody({ text, quote: typeof b.quote === "string" ? b.quote.slice(0, 2000) : null, tags: typeof b.tags === "string" ? b.tags : "" }), ...files].filter(Boolean).join("\n\n");
-  const terminal = await withForeground(a, t);
-  const cli = kindOf(terminal);
-  if (b.pi === true && cli !== "pi") throw sendError("Pi is no longer running in this terminal. Check the terminal before writing a new message.", true);
-  if (cli === "pi") {
-    const pid = terminal?.foreground?.pid;
-    const snapshot = await piSnapshot((script: string, args: string[], on: string | null) => sh(hub, script, args, on), a, pid);
-    const target = piTarget(pid, snapshot);
-    if (!target) throw sendError(PI_UNAVAILABLE, true);
+  if (target) {
     const cid = typeof b.cid === "string" && b.cid ? b.cid.slice(0, 80) : piRequestId();
-    const note = () => { const at = Date.now(); compat.noteSend?.(a, { cid, text, files: sent, at, piGeneration: target.generation }); return at; };
+    const note = () => { const at = Date.now(); compat.noteSend?.(a, { cid, text, files: sent, at, piHistory: piHistoryOf(snapshot) ?? undefined }); return at; };
     const deliver = async (mode: string) => {
       const current = await withForeground(a, hub.terminals.get(a));
       if (current?.state !== "live" || kindOf(current) !== "pi" || current.foreground?.pid !== pid)
@@ -648,9 +651,12 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
   if (b?.type === "send" && typeof b.chat === "string") {
     // what it replies to (2.1 names the message by id) and the tasks it mentions, as the window's chat sends them
     const a = chat(b.chat), r = compat.reader?.(a);
-    const quoted = typeof b.reply === "string" ? r?.conv?.items?.find((x: any) => x.id === b.reply)?.text ?? null : null;
+    const quoted = typeof b.reply === "string" ? r?.conv?.items?.find((x: any) => x.id === b.reply && !x.provisional)?.text ?? null : null;
+    if (typeof b.reply === "string" && (b.pi || b.piHistory || r?.kind === "pi") &&
+        (!quoted || !b.piHistory || b.piHistory !== piHistoryOf(r?.pi))) throw sendError(PI_CHAT_CHANGED, true);
+    // A chat which was not shown as Pi cannot look up a quote and silently retarget it into Pi.
     const tags = mentionedIn(String(b.text ?? ""), compat.tasksFor(b.chat)).map((x: any) => taskTag(x, x.ref ?? `#${x.id}`)).join("");
-    b = { ...b, addr: a, quote: quoted, tags };
+    b = { ...b, addr: a, quote: quoted, tags, ...(r?.kind === "pi" ? { pi: true } : {}) };
   }
   else if ((b?.type === "stop" || b?.type === "steer") && typeof b.chat === "string") b = { ...b, addr: chat(b.chat) };
   else if (b?.type === "stop-job" && typeof b.chat === "string" && typeof b.job === "string") {

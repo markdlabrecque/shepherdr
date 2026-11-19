@@ -15,6 +15,8 @@ export type Watcher = (reader: ChatReader, terminal: any) => void;
 type Followed = { reader: ChatReader; pages: Set<Watcher>; busy: boolean; idleSince: number | null; ready: boolean;
   /** a change came while it was being read: read once more after */
   again?: boolean;
+  /** Pi subscribers may only receive polls that started after they subscribed. */
+  awaiting?: Map<Watcher, object>;
   /** its terminal's watch-only stream, and a read it asked for soon */
   stream?: { close(): void } | null; soon?: ReturnType<typeof setTimeout> | null; last?: number;
   /** what its CLI said it does when last told (the working line's words while no call is open in its log) */
@@ -69,11 +71,11 @@ export class Chats {
     if (f.reader.kind === "pi") {
       // Revalidate before sending anything to a returning page. With nobody watching, discard the old cursor.
       if (!f.pages.size) f.reader.refreshPi();
-      f.ready = false;
+      (f.awaiting ??= new Map()).set(page, {});
     }
     f.pages.add(page);
     f.idleSince = null;
-    if (f.ready) page(f.reader, this.hub.terminals.get(addr));
+    if (f.ready && !f.awaiting?.has(page)) page(f.reader, this.hub.terminals.get(addr));
     void this.tick(addr);
   }
 
@@ -81,6 +83,7 @@ export class Chats {
     const f = this.followed.get(addr);
     if (!f) return;
     f.pages.delete(page);
+    f.awaiting?.delete(page);
     if (!f.pages.size) f.idleSince = Date.now();
   }
 
@@ -137,6 +140,7 @@ export class Chats {
     f.busy = true;
     f.again = false;
     f.last = Date.now();
+    const awaiting = [...(f.awaiting ?? [])];
     try {
       const t = await withForeground(addr, this.hub.terminals.get(addr));
       let changed = await f.reader.locate(t);
@@ -151,6 +155,13 @@ export class Chats {
       if (said !== f.said) { f.said = said; changed = true; }
       const kids = subagentsOf([...this.hub.terminals.values()], addr).map((k: any) => `${k.address}:${k.status}:${k.ended ?? ""}`).join(" ");
       if (kids !== (f.kids ?? "")) { f.kids = kids; changed = true; }
+      if (f.reader.kind !== "pi" || !f.reader.piFresh || f.reader.state === "unavailable") {
+        for (const [page, token] of awaiting) {
+          if (f.awaiting?.get(page) !== token) continue;
+          f.awaiting.delete(page);
+          changed = true;
+        }
+      }
       if (changed || !f.ready) this.publish(addr, f);
     } catch (err) {
       console.error(`chat ${addr}: ${(err as Error).message}`);
@@ -164,6 +175,6 @@ export class Chats {
     if (f.reader.kind === "pi" && f.reader.piFresh && f.reader.state !== "unavailable") return;
     f.ready = true;
     const t = this.hub.terminals.get(addr);
-    for (const page of f.pages) page(f.reader, t);
+    for (const page of f.pages) if (!f.awaiting?.has(page)) page(f.reader, t);
   }
 }

@@ -823,7 +823,13 @@ export function connect() {
         pruned = true
       }
     } else if (msg.type === 'chat') {
-      state = { ...state, chats: { ...state.chats, [msg.chat.key]: msg.chat } }
+      const key = msg.chat.key
+      const quote = state.ui.reply[key]
+      if (msg.chat.cli === 'pi' && quote && !msg.chat.messages.some((m) => m.id === quote.id && !m.provisional)) {
+        const { [key]: _, ...reply } = state.ui.reply
+        state = { ...state, ui: { ...state.ui, reply } }
+      }
+      state = { ...state, chats: { ...state.chats, [key]: msg.chat } }
       putOutbox(settle(state.outbox, msg.chat))
     }
     else if (msg.type === 'terminal') state = { ...state, terms: { ...state.terms, [msg.chat]: { ansi: msg.ansi, cols: msg.cols, rows: msg.rows } } }

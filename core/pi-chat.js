@@ -3,6 +3,7 @@ export const PI_CLIENT = 'exec "$HOME/.local/bin/herdr-pi-chat" "$@"';
 export const PI_UNAVAILABLE = "Pi chat integration unavailable. Install the Shepherdr integration, then run /reload in Pi.";
 export const PI_BLOCKED = "Answer in terminal";
 export const PI_UNCONFIRMED = "Pi did not confirm the send. Check the terminal before sending again.";
+export const PI_CHAT_CHANGED = "Pi changed conversations. Check the terminal before sending these words again.";
 const refusals = {
   blocked: "Pi is waiting for an answer. Answer in the terminal before sending again.",
   stale_instance: "Pi restarted before this message could be sent. Check the terminal before writing a new message.",
@@ -42,6 +43,9 @@ export async function piSnapshot(sh, addr, pid, cursor) {
 export const piPage = (sh, addr, pid, generation, before) => piRead(sh, addr, pid, "page", { generation, before });
 export const piResults = (sh, addr, pid, generation, ids) => piRead(sh, addr, pid, "results", { generation, ids });
 export const samePiHistory = (a, b) => a && b && a.instance === b.instance && a.session === b.session && a.generation === b.generation;
+// A client can submit this identity, but only the bridge can confirm that it is still active.
+export const piHistoryOf = (snapshot) => snapshot ? JSON.stringify([snapshot.instance, snapshot.session, snapshot.generation ?? null,
+  snapshot.generation ? null : snapshot.leaf]) : null;
 
 // Capture this at composition time. Never deliver a queued or retried message to a replacement process/session.
 export function piTarget(pid, snapshot) {
