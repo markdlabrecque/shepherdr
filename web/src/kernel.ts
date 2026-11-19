@@ -5,7 +5,7 @@ import { useSyncExternalStore, type FC, type ReactNode } from 'react'
 import { buildId } from '@shared/build.ts'
 import { expire, loadOutbox, prune, saveOutbox, settle, type Outgoing } from './outbox.ts'
 import { HttpError, wakeAll } from './uploads.ts'
-import { keptOf, mayReload, type Kept } from './reload.ts'
+import { keptOf, mayReload, withoutPiHistory, type Kept } from './reload.ts'
 import { OPEN_WITHIN, PONG_WITHIN, retryIn, SAY_LOST_AFTER } from './link.ts'
 import { groupTasks, loadAllDone, loadGroups, loadShut, keepTasks, namesFor, saveAllDone, saveGroups, saveShut, shownGroup, type GroupBy, type TaskGroup } from './groups.ts'
 import { canDock, CHAT_READ, fit as fitSidebars, focused, loadSidebars, PANEL, RIGHT, saveSidebars, showPanel, toggleFocus as focusTo, type Sidebars } from './sidebars.ts'
@@ -964,7 +964,7 @@ function keep(st: State, text: Record<string, string>) {
   const shown = st.snap ? visibleChats(st.ui, st.snap) : []
   const k = keptOf(st.ui, text)
   try {
-    sessionStorage.setItem('shepherdr.kept', JSON.stringify({ ...k, snap: st.snap ?? undefined, chats: Object.fromEntries(shown.filter((c) => st.chats[c]).map((c) => [c, st.chats[c]])) }))
+    sessionStorage.setItem('shepherdr.kept', JSON.stringify(withoutPiHistory({ ...k, snap: st.snap ?? undefined, chats: Object.fromEntries(shown.filter((c) => st.chats[c]).map((c) => [c, st.chats[c]])) })))
   } catch {
     // too much to keep (a long chat): what was open and typed still comes back
     try {
@@ -979,7 +979,7 @@ function kept(): Kept {
   try {
     const k = sessionStorage.getItem('shepherdr.kept')
     sessionStorage.removeItem('shepherdr.kept')
-    return k ? (JSON.parse(k) as Kept) : {}
+    return k ? withoutPiHistory(JSON.parse(k) as Kept) : {}
   } catch {
     return {}
   }

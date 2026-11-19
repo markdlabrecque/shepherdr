@@ -202,6 +202,21 @@ class Bridge(Scratch):
         self.assertEqual(self.cli("send", held)["status"], "accepted")
         self.assertEqual([s["body"] for s in self.control("idle", True)], ["keep going"])
 
+    def test_forward_navigation_refreshes_before_the_tree_hook(self):
+        self.control("leaf", "user-1")
+        held = self.fields(mode="hold", body="from the ancestor")
+        self.control("idle", False)
+        self.assertEqual(self.cli("send", held)["status"], "waiting")
+        self.control("tree-start")
+        self.control("leaf", "assistant-1")
+        self.control("idle", True)
+        # An earlier session_tree handler can await after Pi has already switched branches.
+        moved = self.cli("snapshot", self.cursor(held))
+        self.assertTrue(moved["reset"])
+        self.assertNotEqual(moved["generation"], held["generation"])
+        self.assertEqual(self.cli("send", held)["error"], "stale_leaf")
+        self.assertEqual(self.control("idle", True), [])
+
     def test_guard_blocked_stale_leaf_session_and_instance(self):
         fields = self.fields()
         self.control("blocked", True)

@@ -46,6 +46,7 @@ export const samePiHistory = (a, b) => a && b && a.instance === b.instance && a.
 // A client can submit this identity, but only the bridge can confirm that it is still active.
 export const piHistoryOf = (snapshot) => snapshot ? JSON.stringify([snapshot.instance, snapshot.session, snapshot.generation ?? null,
   snapshot.generation ? null : snapshot.leaf]) : null;
+export const piQuoteFor = (quote, snapshot) => quote?.piHistory && quote.piHistory === piHistoryOf(snapshot) ? quote : null;
 
 // Capture this at composition time. Never deliver a queued or retried message to a replacement process/session.
 export function piTarget(pid, snapshot) {

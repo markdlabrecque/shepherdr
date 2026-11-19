@@ -31,7 +31,7 @@ import * as fs from "fs/promises";
 import { FIND, LOG, Conversation, records, resultText, summary, excerpt, names, pilotLine } from "./core/chat-log.js";
 import { BgJobs } from "./core/bg-jobs.js";
 import { ChatReader, kindOf } from "./core/chat-reader.js";
-import { piTarget, piSend, piRequestId, piHistoryOf, samePiHistory, PI_UNAVAILABLE, PI_BLOCKED } from "./core/pi-chat.js";
+import { piTarget, piSend, piRequestId, piHistoryOf, piQuoteFor, samePiHistory, PI_UNAVAILABLE, PI_BLOCKED } from "./core/pi-chat.js";
 import { preview } from "./core/recipe.js";
 import { words, howAnswered, codexOnScreen, codexSteps } from "./core/asks.js";
 // The rows' words and rules the web app's chat draws by too (core/chat-view.js).
@@ -627,7 +627,8 @@ export default class Chat extends View {
     if (!d) return;
     if (d.text && !this.box.value()) this.box.set_value(d.text);
     this.files = Array.isArray(d.files) ? d.files : [];
-    this.quote = d.quote ?? null;
+    this.quote = this.kind === "pi" ? (d.quote?.piHistory ? d.quote : null) : d.quote ?? null;
+    if (this.kind === "pi" && this.piReader?.pi) this.quote = piQuoteFor(this.quote, this.piReader.pi);
     this.queue = Array.isArray(d.queue) ? d.queue : [];
     cx.notify();
   }
@@ -1253,7 +1254,7 @@ export default class Chat extends View {
   // person's words and files as a draft, without their old quote and without sending anything.
   recoverPiOutgoing(snapshot, cx) {
     const history = piHistoryOf(snapshot);
-    if (this.piHistory && this.piHistory !== history) this.quote = null;
+    this.quote = piQuoteFor(this.quote, snapshot);
     this.piHistory = history;
     const belongs = (msg) => !msg?.piAddr || (msg.piAddr === this.addr && samePiHistory(msg.pi, snapshot));
     const missed = [...this.pending.filter((p) => !belongs(p.msg)).map((p) => p.msg), ...this.queue.filter((m) => !belongs(m))];
@@ -1488,6 +1489,7 @@ export default class Chat extends View {
     if (!text && !this.files.length) return;
     const msg = { id: this.kind === "pi" ? piRequestId() : `m${Date.now()}`, text, files: this.files, quote: this.quote, hold };
     if (this.kind === "pi") {
+      msg.quote = piQuoteFor(msg.quote, this.piReader?.pi);
       msg.pi = piTarget(this.piReader?.pid, this.piReader?.pi);
       msg.piAddr = this.addr;
     }
@@ -1712,7 +1714,7 @@ export default class Chat extends View {
     const now = this.box.value().trim();
     this.box.set_value(now ? `${msg.text}\n\n${now}` : msg.text);
     this.addFiles(msg.files);
-    if (msg.quote && !this.quote) this.quote = msg.quote;
+    if (msg.quote && !this.quote) this.quote = this.kind === "pi" ? piQuoteFor(msg.quote, this.piReader?.pi) : msg.quote;
     this.box.focus();
     this.saveSoon(cx);
   }
@@ -2359,7 +2361,7 @@ export default class Chat extends View {
     if (what === "copy") this.copy(row.text, row.id, cx);
     if (what === "reply") {
       const t = row.text.replace(/\s+$/, "");
-      this.quote = { text: t.length > 280 ? t.slice(0, 279).trimEnd() + "…" : t };
+      this.quote = { text: t.length > 280 ? t.slice(0, 279).trimEnd() + "…" : t, ...(this.kind === "pi" ? { piHistory: this.piHistory } : {}) };
       this.box.focus();
       this.saveSoon(cx);
     }

@@ -168,6 +168,7 @@ export default function (pi: ExtensionAPI) {
   let stop: (() => Promise<void>) | undefined;
   let blocked = false;
   let revision: (() => void) | undefined;
+  let observe: (() => void) | undefined;
   type Stream = { id: string; manager: ExtensionContext["sessionManager"]; session: string; leaf: string | null };
   let live: (Stream & { message: Assistant }) | undefined;
   let ended: Stream[] = [];
@@ -180,6 +181,7 @@ export default function (pi: ExtensionAPI) {
   };
   pi.on("ui_prompt_start", () => { blocked = true; });
   pi.on("ui_prompt_end", () => { blocked = false; });
+  pi.on("session_before_tree", () => { observe?.(); });
   pi.on("session_tree", () => { revision?.(); });
   pi.on("message_start", ({ message }, ctx) => {
     if (message.role !== "assistant") return;
@@ -212,6 +214,7 @@ export default function (pi: ExtensionAPI) {
     let generation = randomUUID();
     let lastSession: string | undefined;
     let lastLeaf: string | null = null;
+    let lastCount = 0;
     let lastPath: string | undefined;
     let stamp: ReturnType<typeof fileStamp> | undefined;
     let branch: Entry[] = [];
@@ -219,7 +222,7 @@ export default function (pi: ExtensionAPI) {
     const aliases = new Map<string, string>();
     let refresh = true;
     revision = () => { generation = randomUUID(); refresh = true; clearLive(); aliases.clear(); };
-    function current() {
+    function current(sample = false) {
       const session = manager.getSessionId();
       const leaf = manager.getLeafId() ?? null;
       const path = manager.getSessionFile?.();
@@ -229,14 +232,21 @@ export default function (pi: ExtensionAPI) {
       stamp = file.stamp;
       if (changed) revision?.();
       if (refresh || leaf !== lastLeaf) {
+        const entries = manager.getEntries();
         branch = manager.getBranch();
-        const next = indexBranch(branch);
-        if (!refresh && lastLeaf !== null && !next.positions.has(lastLeaf)) {
-          revision?.();
+        if (!refresh) {
+          // Pi can install an existing descendant as its active leaf before session_tree handlers finish.
+          // It is an append only if the active suffix consists entirely of newly appended entries.
+          const parent = lastLeaf === null ? -1 : branch.findIndex((e) => e.id === lastLeaf);
+          const added = entries.slice(lastCount);
+          const suffix = branch.slice(parent + 1);
+          if ((lastLeaf !== null && parent < 0) || !added.length || suffix.length !== added.length ||
+              !added.every((e, i) => e.id === suffix[i].id && e.type !== "branch_summary")) revision?.();
         }
-        index = next;
+        index = indexBranch(branch);
+        lastCount = entries.length;
         refresh = false;
-      }
+      } else if (sample) lastCount = manager.getEntries().length;
       lastSession = session;
       lastPath = path;
       lastLeaf = leaf;
@@ -262,6 +272,9 @@ export default function (pi: ExtensionAPI) {
       if (live && reconcile(live)) live = undefined;
       return { instance, session, leaf, generation };
     }
+
+    // Sample the old leaf and entry count before Pi installs the navigation target.
+    observe = () => { current(true); };
 
     function dispatch(value: unknown) {
       if (!value || typeof value !== "object" || Array.isArray(value)) return error("invalid_request");
@@ -319,7 +332,7 @@ export default function (pi: ExtensionAPI) {
       const digest = createHash("sha256").update(JSON.stringify([session, body])).digest("hex");
       const receipt = receipts.get(id);
       if (receipt) return receipt.digest === digest ? { ok: true, status: receipt.status } : error("id_conflict");
-      if (request.generation !== undefined && request.generation !== generation) return error("stale_leaf");
+      if (request.generation !== generation) return error("stale_leaf");
       // A normal turn advances the leaf. A held message can follow that branch, not another one.
       if (request.leaf !== null && request.leaf !== leaf && !index.positions.has(request.leaf)) {
         return error("stale_leaf");
@@ -375,7 +388,7 @@ export default function (pi: ExtensionAPI) {
     const cleanup = async () => {
       if (stop !== cleanup) return;
       stop = undefined;
-      revision = undefined;
+      revision = observe = undefined;
       clearLive();
       for (const socket of sockets) socket.destroy();
       try { unlink(registry); }

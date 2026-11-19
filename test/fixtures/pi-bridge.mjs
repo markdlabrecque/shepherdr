@@ -40,7 +40,7 @@ const ctx = {
   mode: "tui", model: {}, isIdle: () => idle,
   sessionManager: {
     getSessionId: () => session, getLeafId: () => leaf, getSessionFile: () => file,
-    getBranch: branch,
+    getBranch: branch, getEntries: () => [...entries.values()],
   },
 };
 const sendUserMessage = (body, options) => {
@@ -61,6 +61,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   if (action === "idle") idle = value;
   if (action === "leaf" || action === "tree") leaf = value;
   if (action === "tree") await emit("session_tree");
+  if (action === "tree-start") await emit("session_before_tree");
   if (action === "advance" || action === "fork") append(message(value, "assistant", [text(`reply at ${value}`)]), action === "fork" ? "user-1" : leaf);
   if (action === "root") append(message(value, "user", `root ${value}`), null);
   if (action === "session") session = value;

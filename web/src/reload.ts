@@ -14,6 +14,16 @@ export function mayReload(ui: UI, o: { holds: number; sinceTyped: number; focuse
  *  showed (drawn at once, until the server sends it again) */
 export type Kept = Partial<UI> & { text?: Record<string, string>; snap?: Snapshot; chats?: Record<string, Chat> }
 
+// Pi can change its active branch without changing the terminal's address. Neither its transcript
+// nor a selected quote should render before the new socket verifies what the terminal is showing.
+export function withoutPiHistory(kept: Kept): Kept {
+  const pi = new Set(Object.entries(kept.chats ?? {}).filter(([, chat]) => chat.cli === 'pi').map(([key]) => key))
+  if (!pi.size) return kept
+  const chats = Object.fromEntries(Object.entries(kept.chats ?? {}).filter(([key]) => !pi.has(key)))
+  const reply = kept.reply && Object.fromEntries(Object.entries(kept.reply).filter(([key]) => !pi.has(key)))
+  return { ...kept, chats, reply }
+}
+
 /** what of the screen comes back after a reload: half-typed texts, attached files, replies, what was open */
 export function keptOf(ui: UI, text: Record<string, string>): Kept {
   return {

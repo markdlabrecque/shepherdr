@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { ChatReader } from "../core/chat-reader.js";
-import { piSend, piTarget, piHistoryOf, samePiHistory, PI_BLOCKED, PI_UNCONFIRMED, PI_UNAVAILABLE } from "../core/pi-chat.js";
+import { piSend, piTarget, piHistoryOf, piQuoteFor, samePiHistory, PI_BLOCKED, PI_UNCONFIRMED, PI_UNAVAILABLE } from "../core/pi-chat.js";
 import { messageBody, refusal, sendTyped } from "../core/send.js";
 
 // Run the actual window methods without starting herdr-app or loading its settings.
@@ -117,11 +117,34 @@ test("desktop restores outgoing messages from another Pi branch as a draft witho
   const self = { addr, piHistory: piHistoryOf(old), pending: [{ msg: message("previous send") }],
     queue: [message("previous hold"), message("this branch only", current)], quote: { id: "old quote" }, files: [],
     box: { value: () => draft, set_value: (text: string) => { draft = text; } }, saveSoon() {} };
-  method("recoverPiOutgoing", { piHistoryOf, samePiHistory }).call(self, current, {});
+  method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }).call(self, current, {});
   expect(self.pending).toEqual([]);
   expect(self.queue.map((m) => m.text)).toEqual(["this branch only"]);
   expect(self.quote).toBeNull();
   expect(draft).toBe("existing draft\n\nprevious send\n\nprevious hold");
+});
+
+test("desktop does not attach a restored quote to a replacement Pi session", async () => {
+  const old = { ...snapshot, session: "old", generation: "old" };
+  const current = { ...snapshot, session: "current", generation: "current" };
+  for (const saved of [undefined, piHistoryOf(old), piHistoryOf(current)]) {
+    let text = "";
+    let sent: any;
+    const files = [{ path: "example.txt" }];
+    const self: any = { addr, kind: "pi", phase: "ready", status: () => "idle", piReader: { pid: 77 },
+      pending: [], queue: [], files: [], box: { value: () => text, set_value: (v: string) => { text = v; } },
+      saveSoon() {}, deliver: (msg: any) => { sent = msg; } };
+    const cx = { notify() {}, timer: { after() {} } };
+    await method("loadDraft", { piQuoteFor, fs: { readFile: async () => JSON.stringify({
+      text: "saved words", files, quote: { text: "quoted words", piHistory: saved },
+    }) } }).call(self, cx);
+    self.piReader.pi = current;
+    method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }).call(self, current, cx);
+    method("send", { piTarget, piQuoteFor, piRequestId: () => "send", note() {},
+      mentions: { expand: (v: string) => v, expandTasks: (v: string) => v } }).call(self, cx);
+    expect(sent).toMatchObject({ text: "saved words", files, pi: { session: "current" },
+      quote: saved === piHistoryOf(current) ? { text: "quoted words" } : null });
+  }
 });
 
 test("blocked desktop keeps a draft and Pi-only controls cannot trigger another CLI", () => {
