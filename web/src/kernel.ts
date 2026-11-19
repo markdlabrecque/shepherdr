@@ -5,7 +5,7 @@ import { useSyncExternalStore, type FC, type ReactNode } from 'react'
 import { buildId } from '@shared/build.ts'
 import { expire, loadOutbox, prune, saveOutbox, settle, type Outgoing } from './outbox.ts'
 import { HttpError, wakeAll } from './uploads.ts'
-import { keptOf, mayReload, type Kept } from './reload.ts'
+import { keptOf, mayReload, withoutPiHistory, type Kept } from './reload.ts'
 import { OPEN_WITHIN, PONG_WITHIN, retryIn, SAY_LOST_AFTER } from './link.ts'
 import { groupTasks, loadAllDone, loadGroups, loadShut, keepTasks, namesFor, saveAllDone, saveGroups, saveShut, shownGroup, type GroupBy, type TaskGroup } from './groups.ts'
 import { canDock, CHAT_READ, fit as fitSidebars, focused, loadSidebars, PANEL, RIGHT, saveSidebars, showPanel, toggleFocus as focusTo, type Sidebars } from './sidebars.ts'
@@ -759,7 +759,8 @@ export async function act(a: Action, signal?: AbortSignal) {
   // with its status: a proxy's 502 is the network (uploads.ts transient), the server's own no is not
   if (!r.ok) {
     noteUsage('error', { type: a.type, status: r.status })
-    throw new HttpError(r.status, (await r.text()) || `${r.status}`)
+    const send = r.headers.get('x-shepherdr-send')
+    throw new HttpError(r.status, (await r.text()) || `${r.status}`, send === 'unconfirmed' || send === 'refused' ? send : undefined)
   }
   return r.json().catch(() => ({}))
 }
@@ -822,7 +823,13 @@ export function connect() {
         pruned = true
       }
     } else if (msg.type === 'chat') {
-      state = { ...state, chats: { ...state.chats, [msg.chat.key]: msg.chat } }
+      const key = msg.chat.key
+      const quote = state.ui.reply[key]
+      if (msg.chat.cli === 'pi' && quote && !msg.chat.messages.some((m) => m.id === quote.id && !m.provisional)) {
+        const { [key]: _, ...reply } = state.ui.reply
+        state = { ...state, ui: { ...state.ui, reply } }
+      }
+      state = { ...state, chats: { ...state.chats, [key]: msg.chat } }
       putOutbox(settle(state.outbox, msg.chat))
     }
     else if (msg.type === 'terminal') state = { ...state, terms: { ...state.terms, [msg.chat]: { ansi: msg.ansi, cols: msg.cols, rows: msg.rows } } }
@@ -838,6 +845,12 @@ export function connect() {
 function drop(sock: WebSocket) {
   if (sock !== ws) return
   forget()
+  // Pi may change its active leaf while this tab is offline. Wait for the newly watched snapshot.
+  const chats = Object.entries(state.chats).filter(([, chat]) => chat.cli !== 'pi')
+  if (chats.length !== Object.keys(state.chats).length) {
+    state = { ...state, chats: Object.fromEntries(chats) }
+    emit()
+  }
   downSince ??= Date.now()
   saying ??= sayLater()
   retrying = setTimeout(connect, retryIn(tries++))
@@ -951,11 +964,11 @@ function keep(st: State, text: Record<string, string>) {
   const shown = st.snap ? visibleChats(st.ui, st.snap) : []
   const k = keptOf(st.ui, text)
   try {
-    sessionStorage.setItem('shepherdr.kept', JSON.stringify({ ...k, snap: st.snap ?? undefined, chats: Object.fromEntries(shown.filter((c) => st.chats[c]).map((c) => [c, st.chats[c]])) }))
+    sessionStorage.setItem('shepherdr.kept', JSON.stringify(withoutPiHistory({ ...k, snap: st.snap ?? undefined, chats: Object.fromEntries(shown.filter((c) => st.chats[c]).map((c) => [c, st.chats[c]])) })))
   } catch {
     // too much to keep (a long chat): what was open and typed still comes back
     try {
-      sessionStorage.setItem('shepherdr.kept', JSON.stringify(k))
+      sessionStorage.setItem('shepherdr.kept', JSON.stringify({ ...k, reply: {} }))
     } catch {
       /* private window: the reload still brings the newest screen */
     }
@@ -966,7 +979,7 @@ function kept(): Kept {
   try {
     const k = sessionStorage.getItem('shepherdr.kept')
     sessionStorage.removeItem('shepherdr.kept')
-    return k ? (JSON.parse(k) as Kept) : {}
+    return k ? withoutPiHistory(JSON.parse(k) as Kept) : {}
   } catch {
     return {}
   }

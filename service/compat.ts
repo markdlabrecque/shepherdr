@@ -8,6 +8,7 @@ import type { Snapshot, Place, Task, Need, Section, Machine, Chat, Message, Stat
 import * as T from "../core/tasks.js";
 import * as SPc from "../core/spaces.js";
 import { kindOf as kindOfTerm } from "../core/chat-reader.js";
+import { PI_BLOCKED, piHistoryOf } from "../core/pi-chat.js";
 import * as CL from "../core/chat-log.js";
 import * as CV from "../core/chat-view.js";
 import { taskArtifacts } from "../core/task-artifacts.js";
@@ -20,7 +21,7 @@ import { codexChoice } from "../core/asks.js";
 const { SCREEN } = SCc as any;
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-const CLI_NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex" };
+const CLI_NAMES: Record<string, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi" };
 import * as MNc from "../core/menus.js";
 import * as APc from "../core/autopilot.js";
 const { machineLabel } = MNc as any;
@@ -64,7 +65,7 @@ export const newsKey = (rows: Row[]) => JSON.stringify(rows.filter((r) => r.spac
 
 // a news event's dot: what the task was at that moment
 const NEWS: Record<string, TaskStatus> = { added: "todo", queued: "queued", started: "work", needs: "need", asks: "need", stalled: "need", failed: "need", ready: "ready", merging: "merging", merged: "done", done: "done", closed: "done" };
-type Sent = { cid: string; text: string; files: string[]; at: number };
+type Sent = { cid: string; text: string; files: string[]; at: number; piHistory?: string };
 const said = (v: string) => v.replace(/\s+/g, " ").trim();
 const base = (p: string) => p.split("/").pop() ?? p;
 
@@ -97,10 +98,14 @@ const stepRow = (s: any, i: number) => ({ key: `${s.id ?? i}`, kind: STEP[s.kind
 
 /** A tools row opened (GET api/activity?chat&what=turn&id): each step's line and what it printed, read from the log
  *  only now, as the window's open row (mods/chat loadResults). */
-export async function activity(reader: any, id: string): Promise<ActivityAnswer> {
+export async function activity(reader: any, id: string, view?: string): Promise<ActivityAnswer> {
+  const gone = { error: "That turn isn't in the chat any more." };
+  const current = reader?.piView;
+  if (view !== undefined && view !== current) return gone;
   const x = (reader?.conv?.items ?? []).find((i: any) => i.id === id && i.kind === "tools");
-  if (!x) return { error: "That turn isn't in the chat any more." };
+  if (!x) return gone;
   const outs: Map<string, string> = await reader.results?.(x.steps).catch(() => new Map()) ?? new Map();
+  if (current && (reader.piView !== current || reader.piFresh)) return gone;
   return { steps: x.steps.map((s: any, i: number) => ({ id: `${s.id ?? i}`, kind: STEP[s.kind] ?? "other", tool: s.kind, at: 0, end: 1, title: s.line, doing: s.line, target: "", ...(outs.has(s.id) ? { out: outs.get(s.id) } : {}) })) };
 }
 
@@ -541,7 +546,11 @@ export class Compat {
     const mentionable = this.tasksFor(key);
     const own = this.chats.get(key);
     // what pages sent it, known again in the log: the page's id comes back on it
-    const sends = (own && this.sends.get(own)) || [], takenSends = new Set<string>();
+    const history = piHistoryOf(reader.pi) ?? undefined;
+    const sends = ((own && this.sends.get(own)) || []).filter((s) => s.piHistory === history);
+    const takenSends = new Set<string>();
+    // A Pi terminal can move to a new tree without changing address. Only its current visible rows can name files.
+    if (reader.kind === "pi") this.files.delete(key);
     const asking = !!own && (this.asks?.of(own) ?? []).some((a: any) => a.words?.kind === "questions");
     // Codex's own questions (request_user_input) waiting on its screen: a card that answers them there (SHEP-91), at
     // the end, in place of its "Asked you" box
@@ -598,14 +607,17 @@ export class Compat {
       else if (x.kind === "agent" && x.text) {
         // the pictures and videos it put in its words (core/chat-view.js mediaIn), each right under them as a file of
         // its own, as the person's are; only files a chat names are ever served (fileOf)
-        const md = (CV as any).mediaIn(x.text, { cwd: t?.foreground?.cwd ?? t?.cwd ?? null, home: machine ? null : HOME }) as { text: string; media: { path: string; name: string; alt: string }[] };
+        const md = (x.provisional ? { text: x.text, media: [] } : (CV as any).mediaIn(x.text, { cwd: t?.foreground?.cwd ?? t?.cwd ?? null, home: machine ? null : HOME })) as { text: string; media: { path: string; name: string; alt: string }[] };
         // the suggested next message it ends with (SHEP-186): the box shows it greyed out while nothing is typed
-        if (md.text || !md.media.length) messages.push({ id: x.id, who: "agent", text: md.text || x.text, at: x.at, ...reactions, ...(x.suggest ? { suggest: x.suggest } : {}) });
+        if (md.text || !md.media.length) messages.push({ id: x.id, who: "agent", text: md.text || x.text, at: x.at, ...reactions,
+          ...(x.provisional ? { provisional: true } : {}), ...(x.renderId ? { renderId: x.renderId } : {}),
+          ...(x.suggest ? { suggest: x.suggest } : {}) });
         for (const [n, m] of md.media.entries()) {
           (this.files.get(key) ?? this.files.set(key, new Set()).get(key)!).add(m.path);
           messages.push({ id: `${x.id}:m${n}`, who: "agent", at: x.at, file: { name: m.name, path: m.path, ...(m.alt ? { alt: m.alt } : {}) }, ...(md.text || n ? {} : reactions) } as Message);
         }
       }
+      else if (x.kind === "brief") messages.push({ id: x.id, who: "agent", at: x.at, text: x.text, brief: { label: x.label } });
       else if (x.kind === "error" && x.text) messages.push({ id: x.id, who: "agent", text: x.text, at: x.at, error: true });
       // its own question asked now shows as its card (at the end), in place of its "Asked you" box, as the window's
       else if (x.kind === "ask" && !x.closed && (asking || x === codexCard)) continue;
@@ -626,7 +638,8 @@ export class Compat {
       } else if (x.kind === "tools" && x.steps?.length) {
         // 3.0's tools row: one quiet line ("Ran a command"), opening to each step's line and what it printed
         const rows = x.steps.map(stepRow);
-        messages.push({ id: x.id, who: "agent", at, activity: { id: x.id, at, end: at, rows, steps: x.steps.length, summary: summary(x.steps) } });
+        messages.push({ id: x.id, who: "agent", at, activity: { id: x.id, at, end: at, rows, steps: x.steps.length, summary: summary(x.steps),
+          ...(reader.kind === "pi" ? { resultReady: x.steps.some((s: any) => s.out !== undefined) } : {}) } });
       }
     }
     while (mi < made.length) messages.push(newsLine(made[mi++]));
@@ -669,7 +682,8 @@ export class Compat {
       for (const e of (this.asks as any)?.endsOf?.(r.worker) ?? []) messages.push(quiet(`ae:${e.id}`, e.at, `${r.ref} · ${e.title} · ${e.how}`));
       screens(r.worker, r.ref, by);
     }
-    const st = t?.status?.state ?? null;
+    const pi = reader.kind === "pi";
+    const st = pi ? reader.pi?.state : t?.status?.state ?? null;
     // the CLI's own subagents still at work, then its background shells and watchers, above the box (3.0: the helpers
     // list; core/bg-jobs.js)
     // first its own helper agents in herdr (SHEP-54: a reviewer it started as its hc child), each opening to its own chat
@@ -681,8 +695,8 @@ export class Compat {
       ...(reader.jobs?.() ?? []).map((j: any) => ({ id: `b:${j.id}`, kind: j.kind === "monitor" ? "monitor" as const : "shell" as const, title: j.label, at: j.at ?? Date.now(), command: j.cmd, stop: true, ...(j.path ? { more: "output" as const } : {}) })),
     ];
     // what it runs on, for the line under the box (core/agents.js: the window's model button says the same)
-    let agent: any;
-    try {
+    let agent: any = pi ? { kind: "pi", words: "Pi" } : undefined;
+    if (!pi) try {
       // as the window's chat: the CLI's own settings fill what its arguments and log don't say; a resumed log's model
       // counts only once this process writes
       const kind = reader.kind ?? "claude", dflt = (this.agents as any)?.cached?.(kind, machine) ?? {};
@@ -698,19 +712,21 @@ export class Compat {
     const head = reader.start === 0 ? { top: true } : reader.start ? { earlier: true } : {};
     // the window's lines over the box: what it does while it works (its log's call, else its CLI's status report:
     // core/chat-view.js, as the window's), only waiting (no spinner); asking in its terminal with no card here (Needs you)
-    const report = CV.reportMsg(t);
+    const report = pi ? (st === "blocked" ? PI_BLOCKED : "") : CV.reportMsg(t);
     const cards = messages.some((m) => (m.question && !m.question.closed) || m.secret);
     const under = st === "working" ? { doing: CV.doingWords(reader.conv, report) ?? "", ...(reader.conv?.waiting ? { waits: true } : {}) }
       : st === "blocked" && !cards ? { blocked: report.replace(/^answer:\s*/i, "") } : {};
     // a note under the conversation (a lost session being started again: service/watch.ts)
-    const note = addr ? watch?.notes?.get(addr)?.text : undefined;
+    const note = pi && st === "error" ? "Pi reported an error. Check the terminal." : addr ? watch?.notes?.get(addr)?.text : undefined;
     // instead of the conversation, the window's notice: still opening, not a chat agent, its log not found, ended
     const kind = kindOfTerm(t);
-    const notice = !reader.conv && (reader.state === "finding" || reader.state === "pending") ? "opening"
+    const notice = reader.state === "unavailable" ? "pi-unavailable" : !reader.conv && (reader.state === "finding" || reader.state === "pending") ? "opening"
       : reader.state === "missing" && reader.pinned ? "gone"
       : reader.state === "none" || reader.state === "missing" ? ((t && t.state !== "live") || !t ? "ended" : kind ? "none" : "unsupported")
       : !reader.pinned && (!t || t.state !== "live") && !items.length ? "ended" : null;
     const failed = failedOf(addr);
-    return { key, messages, ...(failed.length ? { failed } : {}), ...head, ...under, ...(note ? { note } : {}), ...(notice ? { notice } : {}), ...(agent ? { agent } : {}), ...(jobs.length ? { jobs } : {}), working: st === "working", cli: reader.kind === "codex" ? "codex" : "claude", ...(reader.pinned || (t && t.state !== "live") ? { finished: true } : {}) };
+    const piHistory = reader.piView ? { piView: reader.piView, piHistory: history,
+      ...(reader.start != null ? { piBefore: reader.start } : {}) } : {};
+    return { key, messages, ...piHistory, ...(failed.length ? { failed } : {}), ...head, ...under, ...(note ? { note } : {}), ...(notice ? { notice } : {}), ...(agent ? { agent } : {}), ...(jobs.length ? { jobs } : {}), working: st === "working", cli: pi ? "pi" : reader.kind === "codex" ? "codex" : "claude", ...(reader.pinned || (t && t.state !== "live") ? { finished: true } : {}) };
   }
 }

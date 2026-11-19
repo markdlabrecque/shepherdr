@@ -1,11 +1,28 @@
 import { expect, test } from 'bun:test'
-import { expire, KEEP_PAST, loadOutbox, partsOf, settle, type Outgoing } from './outbox.ts'
+import { expire, KEEP_PAST, loadOutbox, partsOf, settle, unconfirmedPi, type Outgoing } from './outbox.ts'
 import type { Chat } from '@shared/types.ts'
 
 // What you sent comes back from the agent's log without its id: it takes the pending one's place by its words, files
 // and time, by the server's clock against the log's (the agent may be on another machine).
 const sent = (o: Partial<Outgoing> = {}): Outgoing => ({ cid: 'c1', chat: 'k', text: 'cool', files: [], at: 1, state: 'sent', serverAt: 10_000, prior: ['old'], ...o })
 const chat = (messages: Chat['messages']): Chat => ({ key: 'k', cli: 'Claude Code', messages })
+
+test('a Pi send without a receipt keeps its words and no Retry, even after expiry', () => {
+  const sending = sent({ pi: true, piInFlight: true, state: 'sending' })
+  const failed = unconfirmedPi(sending)
+  expect(failed).toMatchObject({ state: 'failed', text: sending.text, ambiguous: true, noRetry: true })
+  expect(expire([sending], 12 * 60_000)).toEqual([failed])
+  expect(settle([failed], { ...chat([]), cli: 'pi', failed: [{ cid: 'c1', error: 'Pi changed branches.', noRetry: true }] })[0])
+    .toMatchObject({ state: 'failed', error: 'Pi changed branches.', noRetry: true, ambiguous: undefined })
+})
+
+test('a pending Pi send is recoverable but never displayed or settled on a different branch', () => {
+  const o = sent({ pi: true, piHistory: 'viewed', prior: ['old'] })
+  const replacement: Chat = { ...chat([{ id: 'renamed-old', who: 'you', text: 'cool', at: 10_800 }]), cli: 'pi', piHistory: 'replacement' }
+  expect(partsOf(o, replacement)).toEqual([])
+  expect(settle([o], replacement)).toEqual([o])
+  expect(settle([o], { ...replacement, piHistory: 'viewed', messages: [{ id: 'new', who: 'you', text: 'cool', cid: o.cid }] })).toEqual([])
+})
 
 test('the real message takes its place', () => {
   expect(settle([sent()], chat([{ id: 'old', who: 'you', text: 'cool', at: 1 }, { id: 'u2', who: 'you', text: 'cool', at: 10_800 }]))).toEqual([])
