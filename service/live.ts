@@ -5,11 +5,12 @@ import type { Hub } from "./hub.ts";
 import type { Store } from "./store.ts";
 import type { Me } from "./tailscale.ts";
 
-import type { Chats, Watcher } from "./chats.ts";
+import { withForeground, type Chats, type Watcher } from "./chats.ts";
 import type { Compat } from "./compat.ts";
+import { kindOf } from "../core/chat-reader.js";
 
 // A page's socket: the chats it follows (by 2.1's chat key), each with the terminal and the watcher it holds.
-type WS = ServerWebSocket<{ who: string; keys?: string[]; chats?: Map<string, { addr: string; watcher: Watcher }>; push?: string | null; visible?: boolean; seen?: number; from?: string | null }>;
+type WS = ServerWebSocket<{ who: string; keys?: string[]; chats?: Map<string, { addr: string; watcher: Watcher }>; term?: string; push?: string | null; visible?: boolean; seen?: number; from?: string | null }>;
 
 /** how long a wake word (or an open, SHEP-246) waits for a page of its device to show up */
 export const WAKE_HELD_MS = 15_000;
@@ -21,6 +22,8 @@ export class Live {
   private timer: ReturnType<typeof setTimeout> | null = null;
 
   chats: Chats | null = null;
+  /** A selected ordinary tab turned out to be Pi; refresh the sidebar's tab metadata. */
+  onPiTab: (() => void) | null = null;
   /** told which devices have the app on screen (they get no push) */
   onVisible: ((endpoints: Set<string>) => void) | null = null;
   /** told which tailnet device a push subscription is on (a page knows both): push.ts nodeOf */
@@ -34,6 +37,14 @@ export class Live {
     hub.on((e) => {
       if (e.type === "reset") { void this.machines(); this.agents(); }
       else if ("terminal" in e && e.terminal) this.agents();
+      const changed = "terminal" in e && (e.type === "foreground" || e.type === "restarted") ? e.terminal : null;
+      if (e.type === "reset" || changed) {
+        // Let Chats discard its old foreground cache before probing a selected tab again.
+        queueMicrotask(() => {
+          for (const term of new Set([...this.pages].map((ws) => ws.data.term)))
+            if (term && (!changed || this.compat?.addrOf(term) === changed)) this.discoverPiTab(term);
+        });
+      }
     });
     store.on((d) => this.put("state", d));
     setInterval(() => void this.machines(), 15_000);
@@ -93,6 +104,15 @@ export class Live {
     }
   }
 
+  private discoverPiTab(term: string) {
+    const addr = this.compat?.addrOf(term);
+    const t = addr ? this.hub.terminals.get(addr) : null;
+    if (addr && t?.state === "live" && !kindOf(t))
+      void withForeground(addr, t).then((current) => {
+        if (kindOf(current) === "pi" && this.hub.terminals.get(addr)?.created_ms === t.created_ms) this.onPiTab?.();
+      });
+  }
+
   message(ws: WS, text: string) {
     let m: any;
     try { m = JSON.parse(text); } catch { return; }
@@ -101,6 +121,9 @@ export class Live {
     if (m?.type === "ping") ws.send(JSON.stringify({ type: "pong", at: m.at ?? null }));
     else if (m?.type === "watch" && Array.isArray(m.chats)) {
       this.watch(ws, m.chats.filter((k: unknown) => typeof k === "string" && k.length < 200));
+      const term = typeof m.term === "string" && m.term.startsWith("t:") && m.term.length < 200 ? m.term : undefined;
+      if (term && term !== ws.data.term) this.discoverPiTab(term);
+      ws.data.term = term;
       ws.data.push = typeof m.push === "string" ? m.push : null;
       ws.data.visible = m.visible !== false;
       this.visibleNow();

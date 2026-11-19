@@ -8,7 +8,8 @@ import type { Snapshot, Place, Task, Need, Section, Machine, Chat, Message, Stat
 import * as T from "../core/tasks.js";
 import * as SPc from "../core/spaces.js";
 import { kindOf as kindOfTerm } from "../core/chat-reader.js";
-import { PI_BLOCKED, piHistoryOf } from "../core/pi-chat.js";
+import { cachedPiKind } from "./chats.ts";
+import { PI_BLOCKED, piHistoryOf, piVisibleBody } from "../core/pi-chat.js";
 import * as CL from "../core/chat-log.js";
 import * as CV from "../core/chat-view.js";
 import { taskArtifacts } from "../core/task-artifacts.js";
@@ -65,24 +66,30 @@ export const newsKey = (rows: Row[]) => JSON.stringify(rows.filter((r) => r.spac
 
 // a news event's dot: what the task was at that moment
 const NEWS: Record<string, TaskStatus> = { added: "todo", queued: "queued", started: "work", needs: "need", asks: "need", stalled: "need", failed: "need", ready: "ready", merging: "merging", merged: "done", done: "done", closed: "done" };
-type Sent = { cid: string; text: string; files: string[]; at: number; piHistory?: string };
+type Sent = { cid: string; text: string; files: string[]; at: number; piHistory?: string;
+  pi?: { body: string; prior: Set<string>; consumed?: string } };
 const said = (v: string) => v.replace(/\s+/g, " ").trim();
 const base = (p: string) => p.split("/").pop() ?? p;
 
 /** The page's id for one of the person's messages in the log: what it sent lately with the same words (the paths of
  *  its files after them taken off; pictures come as markers Claude Code took out), read from when it began to go in.
  *  Each send is one message (taken). */
-export function sentAs(sends: Sent[], x: { text?: string; at?: number; images?: number; paths?: string[] }, taken: Set<string>): string | undefined {
+export function sentAs(sends: Sent[], x: { id?: string; text?: string; at?: number; images?: number; paths?: string[]; piBody?: string }, taken: Set<string>): string | undefined {
   const at = x.at ?? 0;
   const s = sends.find((s) => {
     if (taken.has(s.cid) || at < s.at - 5000 || at - s.at > 30 * 60_000) return false;
+    if (s.piHistory) return !!x.id && !!s.pi && !s.pi.prior.has(x.id) && x.piBody === s.pi.body
+      && (!s.pi.consumed || s.pi.consumed === x.id);
     const names = new Set(s.files.map(base));
     const lines = String(x.text ?? "").split("\n");
     const words = said(lines.filter((l) => !(/^[/~]/.test(l.trim()) && names.has(base(l.trim())))).join("\n"));
     // (files alone: no words on either side)
     return words === said(s.text) && (!!words || s.files.length > 0);
   });
-  if (s) taken.add(s.cid);
+  if (s) {
+    taken.add(s.cid);
+    if (s.pi && x.id) s.pi.consumed = x.id;
+  }
   return s?.cid;
 }
 
@@ -295,8 +302,12 @@ export class Compat {
   /** agent address -> what pages sent it lately (service/actions.ts): a message waiting in its CLI's queue is known
    *  again by its words, and shows with the page's id and files */
   sends = new Map<string, Sent[]>();
+  onPiSend: ((addr: string) => void) | null = null;
   noteSend(addr: string, s: Sent) {
+    if (s.pi) s = { ...s, pi: { ...s.pi, body: piVisibleBody(s.pi.body) } };
     this.sends.set(addr, [...(this.sends.get(addr) ?? []).filter((x) => x.cid !== s.cid && Date.now() - x.at < 30 * 60_000), s].slice(-20));
+    // The corresponding Pi row may have been published before the bridge receipt reached the service.
+    if (s.pi) this.onPiSend?.(addr);
   }
 
   addrOf(key: string) { return this.chats.get(key) ?? null; }
@@ -338,7 +349,7 @@ export class Compat {
       const tabs =(s.tabs ?? []).map((t: any) => ({ id: t.id, raw: t.name, addr: (t.terminals ?? [])[0] })).filter((t: any) => t.addr && t.addr !== s.assistant)
         .map((t: any) => {
           chats.set(`t:${t.addr}`, t.addr);
-          const k: any = (this as any).terminalsOf?.(t.addr), cli = kindOfTerm(k), agent = agentIn(k);
+          const k: any = (this as any).terminalsOf?.(t.addr), cli = kindOfTerm(k) ?? cachedPiKind(t.addr, k), agent = agentIn(k);
           const prog = cli ? CLI_NAMES[cli] ?? cli : agent?.name ?? null;
           return { id: t.id, name: (MNc as any).tabName(named(t.raw) ? t.raw : "", prog), named: named(t.raw), term: `t:${t.addr}`,
             ...(cli ? { cli } : {}), ...(agent || cli ? { agent: agent?.key ?? cli } : {}), state: stateOf(k), where: shortHome(k?.foreground?.cwd ?? k?.cwd),

@@ -10,7 +10,7 @@ import { act, agentChat, definePlugin, getState, openItem, placeOf, setUI, shown
 import { CTRL, ic, MenuItem, MenuSeparator, MenuSetting, ModelIcon, shortcut, Small, Tab, Tabs, TermIcon } from '@client/ui.tsx'
 import type { Place, TermScreen } from '@shared/types.ts'
 import { connectTerminal, streamInput } from './stream.ts'
-import { keysTerm, termInPlace, termInput, touchScreen, typedInBox } from './shown.ts'
+import { keysTerm, tabCanChat, tabInChat, termInPlace, termInput, touchScreen, typedInBox } from './shown.ts'
 import { colsOf, fitFont, foldShown, frame, LINE, MAX, MIN, PAD, ZOOM } from './screen.ts'
 
 const KEYMAP: Record<string, string> = {
@@ -321,9 +321,9 @@ function PlaceTerm({ place }: { place: Place }) {
             )
           })
         : null}
-      {/* the shown tab's Chat | Terminal, as the same two choices (another tab's: Claude Code's and Codex's) */}
+      {/* the shown tab's Chat | Terminal, as the same two choices */}
       {other ? (
-        ['claude', 'codex'].includes(place.tabs?.find((t) => t.term === ui.term)?.cli ?? '') ? (
+        tabCanChat(place.tabs?.find((t) => t.term === ui.term)?.cli) ? (
           <MenuSetting name="Show" icon={<TermIcon className={ic} />} choices={(['chat', 'terminal'] as const).map((v) => ({
             label: v === 'chat' ? 'Chat' : 'Terminal', on: (ui.tabView?.[ui.term!] ?? 'terminal') === v,
             onClick: () => setUI((u) => ({ tabView: { ...u.tabView, [u.term!]: v }, menu: false })),
@@ -348,9 +348,9 @@ function ChatOrTerminal({ place }: { place: Place }) {
   const view = useUI((u) => (shown ? u.tabView?.[shown] : undefined))
   if (device === 'phone') return null
   if (shown) {
-    // another tab: Claude Code's and Codex's have it too (3.0's pane header: a chat reads their own session logs)
+    // An ordinary agent tab can show its own chat, not the Assistant's.
     const tab = place.tabs?.find((t) => t.term === shown)
-    if (!tab || !['claude', 'codex'].includes(tab.cli ?? '')) return null
+    if (!tabCanChat(tab?.cli)) return null
     const chat = view === 'chat'
     const pick = (v: 'chat' | 'terminal') => setUI((ui) => ({ tabView: { ...ui.tabView, [shown]: v }, menu: false, pick: null }))
     return (
@@ -400,7 +400,13 @@ export default definePlugin({
             requestAnimationFrame(() => document.querySelector<HTMLElement>(SCREEN)?.focus())
             return true
           }
-          const c = placeOf(snap, ui.place).chat
+          const place = placeOf(snap, ui.place)
+          const piTab = place.tabs?.find((t) => t.term === ui.term && t.cli === 'pi')
+          if (piTab) {
+            setUI({ tabView: { ...ui.tabView, [piTab.term]: tabInChat(ui, piTab.term) ? 'terminal' : 'chat' }, arts: null, kb: true })
+            return true
+          }
+          const c = place.chat
           setUI({ term: ui.term === c ? null : c, arts: null, kb: true })
           return true
         }

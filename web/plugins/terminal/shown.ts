@@ -3,6 +3,9 @@ import type { UI } from '@client/kernel.ts'
 
 type Shown = Pick<UI, 'term' | 'tabView'>
 
+/** An ordinary agent tab can open its chat, as well as the terminal. */
+export const tabCanChat = (cli?: string) => cli === 'claude' || cli === 'codex' || cli === 'pi'
+
 /** one of a space's other agent tabs (t:<terminal>) switched to Chat (3.0's Chat | Terminal): its chat shows */
 export const tabInChat = (ui: Shown, key: string) => key.startsWith('t:') && ui.tabView?.[key] === 'chat'
 

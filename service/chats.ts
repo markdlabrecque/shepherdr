@@ -5,7 +5,7 @@
 // chat and on each change (it sends what it shows: compat.ts).
 import type { Hub } from "./hub.ts";
 import { sh } from "./model.ts";
-import { ChatReader } from "../core/chat-reader.js";
+import { ChatReader, kindOf } from "../core/chat-reader.js";
 import { reportMsg, subagentsOf } from "../core/chat-view.js";
 import { failedOf } from "./send-once.ts";
 
@@ -39,19 +39,31 @@ function readerFor(io: any, addr: string) {
 /** A terminal as the live list has it may lack its foreground program (the log is found by its pid): another
  *  machine's always, and this machine's too on some herdr-core versions (#748). hc get has it, asked at most every
  *  10 s per terminal. */
-const fg = new Map<string, { at: number; foreground: any }>();
+type ForegroundLookup = { at: number; created: number | undefined; foreground: any; pending?: Promise<void> };
+const fg = new Map<string, ForegroundLookup>();
+// A newly selected ordinary tab may not be watchable as a chat yet: its raw record has no foreground.
+// Only opt discovered Pi tabs into the switch; don't change how other tab kinds are shown.
+export function cachedPiKind(addr: string, t: any) {
+  const c = fg.get(addr);
+  return t?.state === "live" && !t.foreground?.pid && c && c.created === t.created_ms
+    && kindOf({ foreground: c.foreground }) === "pi" ? "pi" : null;
+}
 export async function withForeground(addr: string, t: any) {
   if (!t || t.foreground?.pid || t.state !== "live") return t;
   let c = fg.get(addr);
-  if (!c || Date.now() - c.at > 10_000) {
-    let foreground = null;
-    try {
-      const p = Bun.spawn([process.env.SHEPHERDR_HC || "hc", "get", addr, "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore" });
-      foreground = JSON.parse(await new Response(p.stdout).text())?.foreground ?? null;
-    } catch {}
-    fg.set(addr, (c = { at: Date.now(), foreground }));
+  if (!c || c.created !== t.created_ms || Date.now() - c.at > 10_000) {
+    const entry: ForegroundLookup = { at: Date.now(), created: t.created_ms, foreground: c?.created === t.created_ms ? c?.foreground : null };
+    fg.set(addr, (c = entry));
+    entry.pending = (async () => {
+      try {
+        const p = Bun.spawn([process.env.SHEPHERDR_HC || "hc", "get", addr, "--json"], { stdout: "pipe", stderr: "ignore", stdin: "ignore" });
+        entry.foreground = JSON.parse(await new Response(p.stdout).text())?.foreground ?? null;
+      } catch { entry.foreground = null; }
+      entry.at = Date.now();
+    })();
   }
-  return c.foreground ? { ...t, foreground: c.foreground } : t;
+  await c.pending;
+  return fg.get(addr) === c && c.foreground ? { ...t, foreground: c.foreground } : t;
 }
 
 export class Chats {
@@ -60,7 +72,12 @@ export class Chats {
   constructor(private hub: Hub) {
     const io = { sh: (script: string, args: string[], on: string | null) => sh(hub, script, args, on) };
     this.io = io;
-    hub.on((e) => { if ("terminal" in e && e.terminal && this.followed.has(e.terminal)) void this.tick(e.terminal); });
+    hub.on((e) => {
+      if (e.type === "reset") fg.clear();
+      if (!("terminal" in e) || !e.terminal) return;
+      if (["foreground", "restarted", "finished", "removed", "lost"].includes(e.type)) fg.delete(e.terminal);
+      if (this.followed.has(e.terminal)) void this.tick(e.terminal);
+    });
     setInterval(() => { for (const a of this.followed.keys()) void this.tick(a); }, 1000);
   }
   private io: { sh: (script: string, args: string[], on: string | null) => Promise<{ code: number; stdout: string }> };
@@ -85,6 +102,15 @@ export class Chats {
     f.pages.delete(page);
     f.awaiting?.delete(page);
     if (!f.pages.size) f.idleSince = Date.now();
+  }
+
+  /** A chat's send receipt can add a CID without a new snapshot. */
+  refresh(addr: string) {
+    const f = this.followed.get(addr);
+    if (!f?.ready) return;
+    // A page's publish failure must not turn Pi's successful receipt into a send failure.
+    try { this.publish(addr, f); }
+    catch (err) { console.error(`chat ${addr}: ${(err as Error).message}`); }
   }
 
   /** Tells every page its chats again (what they show changed outside the logs: an ask). */

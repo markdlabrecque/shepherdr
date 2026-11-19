@@ -4,7 +4,7 @@
 // the terminal's title, the folder, and the agent's status; buttons split, zoom and close
 // this pane. Props from the app: { pane, terminal }. Click: focus the pane.
 //
-// Agent panes (Claude Code, Codex) also get a Chat / Terminal switch. Chat puts the `chat`
+// Agent panes (Claude Code, Codex, Pi) also get a Chat / Terminal switch. Chat puts the `chat`
 // mod in the agent pane's exact spot: it splits beside the agent's pane, then the agent's
 // terminal is parked (it keeps running, without a pane), so the chat takes the whole slot and
 // every other pane stays as it was. Terminal does the reverse: the terminal gets a pane
@@ -40,8 +40,8 @@ function folder(cwd) {
   return cwd === h ? "~" : cwd.startsWith(h + "/") ? "~" + cwd.slice(h.length) : cwd;
 }
 
-// Chat reads Claude Code's and Codex's own session logs; other agents have no chat.
-const chatty = (p) => Boolean(p?.terminal) && (["claude-code", "codex"].includes(p.app) || ["claude", "codex"].includes(p.program?.key));
+// Recognize chat agents by their reported app or detected program key.
+const chatty = (p) => Boolean(p?.terminal) && (["claude-code", "codex", "pi"].includes(p.app) || ["claude", "codex", "pi"].includes(p.program?.key));
 
 const chatPanes = () => new Set(panes().filter((p) => p.mod === CHAT).map((p) => p.pane));
 // The chat pane showing a terminal, if one is open.

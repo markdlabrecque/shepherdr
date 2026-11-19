@@ -8,6 +8,7 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { sendBody, steerNow, messageBody, refusal, reactionLine, mentionedIn, taskTag } from "../core/send.js";
 import { kindOf } from "../core/chat-reader.js";
+import { piConversation } from "../core/chat-log.js";
 import { WORDS } from "../core/chat-view.js";
 import { settle } from "../core/pending.js";
 import * as AGa from "../core/agents.js";
@@ -78,11 +79,18 @@ async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
   const body = [messageBody({ text, quote: typeof b.quote === "string" ? b.quote.slice(0, 2000) : null, tags: typeof b.tags === "string" ? b.tags : "" }), ...files].filter(Boolean).join("\n\n");
   if (target) {
     const cid = typeof b.cid === "string" && b.cid ? b.cid.slice(0, 80) : piRequestId();
-    const note = () => { const at = Date.now(); compat.noteSend?.(a, { cid, text, files: sent, at, piHistory: piHistoryOf(snapshot) ?? undefined }); return at; };
+    const history = piHistoryOf(snapshot) ?? undefined;
+    const prior = new Set<string>(piConversation(snapshot.items, snapshot).items.filter((x: any) => x.kind === "user").map((x: any) => x.id));
+    let at = Date.now();
+    const note = () => { compat.noteSend?.(a, { cid, text, files: sent, at, piHistory: history, pi: { body, prior } }); return at; };
     const deliver = async (mode: string) => {
       const current = await withForeground(a, hub.terminals.get(a));
       if (current?.state !== "live" || kindOf(current) !== "pi" || current.foreground?.pid !== pid)
         return { code: 1, stderr: "Pi is no longer running in this terminal. Check the terminal before writing a new message.", noRetry: true };
+      // A held send may see more rows before Pi settles. Exclude them before the transport, not after an ack.
+      const reader = compat.reader?.(a);
+      if (history === piHistoryOf(reader?.pi)) for (const x of reader?.conv?.items ?? []) if (x.kind === "user") prior.add(x.id);
+      at = Date.now();
       return piSend((script: string, args: string[], on: string | null, input: string) =>
         exec(hub, ["sh", "-c", script, ...args], on, 10, input), a, target, cid, body, mode);
     };
