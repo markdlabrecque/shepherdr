@@ -5,7 +5,7 @@
 // Shared core: the source is core/chat-reader.js.
 
 import { FIND, LOG, Conversation, records, resultText, piConversation } from "./chat-log.js";
-import { piSnapshot, piPage, piResults, samePiHistory } from "./pi-chat.js";
+import { piSnapshot, piPage, piResults, samePiHistory, piCanKeepWindow, piPageEndsAt } from "./pi-chat.js";
 import { BgJobs } from "./bg-jobs.js";
 
 export const PAGE = 200;
@@ -126,15 +126,36 @@ export class ChatReader {
   }
 
   rebuildPi() {
-    const live = (this.pi.live ?? []).map((x) => ({ ...x, provisional: true }));
-    this.conv = piConversation([...this.piItems, ...live], this.pi);
+    const live = this.pi.state === "working" || this.pi.state === "blocked" ? this.pi.live ?? [] : [];
+    this.conv = piConversation([...this.piItems, ...live.map((x) => ({ ...x, provisional: true }))], this.pi);
+  }
+
+  piAnchor(id) {
+    const final = id && this.conv?.items.find((x) => x.renderId && (x.renderId === id || id.startsWith(`${x.renderId}:`)));
+    return final ? final.id + id.slice(final.renderId.length) : id;
+  }
+
+  // A page/result can discover navigation before the next poll does. Fence all in-flight
+  // requests, including snapshots taken before that reply, and revalidate from scratch.
+  acceptsPiReply(reply, barrier) {
+    if (barrier !== this.piBarrier || !reply) return false;
+    if (samePiHistory(this.pi, reply)) return true;
+    this.refreshPi();
+    return false;
   }
 
   async pullPi() {
     const barrier = this.piBarrier, seq = ++this.piReadSeq;
+    const current = () => this.piBarrier === barrier && this.piReadSeq === seq;
     const previous = this.piFresh ? null : this.pi;
-    const next = await piSnapshot(this.io.sh, this.addr, this.pid, previous);
-    if (this.piBarrier !== barrier || this.piReadSeq !== seq) return false;
+    const validDelta = (s) => samePiHistory(previous, s) && s.before === this.piEnd;
+    let next = await piSnapshot(this.io.sh, this.addr, this.pid, previous);
+    if (!current()) return false;
+    if (previous && (next?.error === "stale_revision" || (next?.reset === false && !validDelta(next)))) {
+      this.refreshPi();
+      return this.pullPi();
+    }
+    if (next?.error === "stale_revision" || (next?.generation && next.reset === false && !previous)) next = null;
     if (!next) {
       if (this.state === "unavailable") return false;
       this.refreshPi();
@@ -143,18 +164,35 @@ export class ChatReader {
       this.state = "unavailable";
       return true;
     }
-    const replace = !samePiHistory(previous, next) || next.reset !== false;
+    const snapshot = !next.generation || next.reset !== false;
     const version = JSON.stringify([next.instance, next.session, next.leaf, next.generation, next.state, next.live]);
     if (next.generation) {
-      // A newer bridge signals append or replacement explicitly. Never splice a delta from a different history.
-      if (next.reset === false && (replace || next.before !== this.piEnd)) { this.refreshPi(); return false; }
-      if (!replace && !next.items.length && version === this.piVersion) return false;
+      if (!snapshot && !next.items.length && version === this.piVersion) return false;
     } else if (JSON.stringify(next) === this.piVersion && !this.piFresh) return false;
-    if (replace) {
-      this.piBarrier = {};
-      this.piView = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      this.piItems = next.items;
-      this.start = next.before ?? null;
+    if (snapshot) {
+      let window = next;
+      if (this.piItems.length && samePiHistory(this.pi, next) && next.generation) {
+        // A wide compaction summary or a burst of output can push the newest page past
+        // the loaded history. Bridge a small gap to keep scroll anchors, but never fetch
+        // an unbounded backlog on reconnect: a large gap remains available via Earlier.
+        for (let remaining = 2; remaining > 0 && window.before > this.piEnd; remaining--) {
+          const page = await piPage(this.io.sh, this.addr, this.pid, next.generation, window.before);
+          if (!current() || (page && !this.acceptsPiReply(page, barrier))) return false;
+          if (!piPageEndsAt(page, window.before)) break;
+          window = { ...window, before: page.before, items: [...page.items, ...window.items] };
+        }
+      }
+      const keep = piCanKeepWindow(this.pi, this.start, this.piEnd, this.piItems, window);
+      if (keep) {
+        const prefix = this.piItems.slice(0, Math.max(0, window.before - this.start));
+        this.piItems = [...prefix, ...window.items];
+        this.start = window.before - prefix.length;
+      } else {
+        this.piBarrier = {};
+        this.piView = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        this.piItems = next.items;
+        this.start = next.before ?? null;
+      }
     } else if (next.items.length) this.piItems.push(...next.items);
     this.piEnd = next.generation ? next.before + next.items.length : null;
     this.piFresh = false;
@@ -213,9 +251,7 @@ export class ChatReader {
       const { generation } = this.pi, barrier = this.piBarrier;
       const ids = [...new Set(want.map((s) => s.out))].slice(0, 10);
       const r = await piResults(this.io.sh, this.addr, this.pid, generation, ids);
-      if (barrier !== this.piBarrier) return out;
-      if (r?.error === "stale_revision") this.refreshPi();
-      if (!samePiHistory(this.pi, r) || !Array.isArray(r.outputs)) return out;
+      if (!this.acceptsPiReply(r, barrier) || !Array.isArray(r.outputs)) return out;
       for (const x of r.outputs) for (const s of want) if (x.id === s.out) out.set(s.id, x.text);
       return out;
     }
@@ -238,9 +274,8 @@ export class ChatReader {
       if (this.piFresh || !this.start || !this.pi?.generation || (view !== undefined && view !== this.piView)) return false;
       const { generation } = this.pi, before = this.start, barrier = this.piBarrier;
       const r = await piPage(this.io.sh, this.addr, this.pid, generation, before);
-      if (barrier !== this.piBarrier || this.start !== before) return false;
-      if (r?.error === "stale_revision") this.refreshPi();
-      if (!samePiHistory(this.pi, r) || !Array.isArray(r.items) || !(r.before >= 0 && r.before < before)) return false;
+      if (!this.acceptsPiReply(r, barrier) || this.start !== before) return false;
+      if (!piPageEndsAt(r, before)) return false;
       this.start = r.before;
       this.piItems = [...r.items, ...this.piItems];
       this.rebuildPi();

@@ -147,7 +147,7 @@ test("selecting an ordinary remote terminal discovers Pi before its chat is watc
 });
 
 test("web keeps a repeated Pi send pending until a new exact body appears", async () => {
-  const at = Date.now(), active = { ...snap, state: "working", generation: "g1" };
+  const at = Date.now(), active = { ...snap, state: "working", generation: "g1", reset: true, before: 0, live: [] };
   const old = { id: "old", role: "user", text: "continue", at: at - 10 };
   const items = [old, { id: "reply", role: "assistant", text: "still working", at }];
   let records = items;
@@ -260,12 +260,13 @@ test("web publishes Pi append, earlier, branch replacement and a revalidated rec
     const details = activity(chats.reader(addr), tool.id, view);
     await until(() => finishResult);
     getSnapshot = () => ({ ...shape, generation: "other", leaf: "fork", before: 0,
-      items: [row("fork:0", "fork only"), row("notice:0", "retained history", "compaction")] });
+      items: [row("fork:0", "fork only"), row("notice:0", "retained history", "compaction"),
+        row("edit:0", "changed model context", "context-edit")] });
     await until(() => latest().piView !== view);
     finishResult?.({ ...shape, outputs: [{ id: "call:0", text: "out from old branch" }] });
     expect(await details).toHaveProperty("error");
-    expect(latest().messages.map((m) => m.text)).toEqual(["fork only", "retained history"]);
-    expect(latest().messages[1].brief?.label).toBe("Compaction summary");
+    expect(latest().messages.map((m) => m.text)).toEqual(["fork only", "retained history", "changed model context"]);
+    expect(latest().messages.slice(1).map((m) => m.brief?.label)).toEqual(["Compaction summary", "Context edit"]);
     await chats.earlier(addr, view);
     expect(queried.filter(([op]) => op === "page")).toHaveLength(1);
     chats.unwatch(addr, page);
@@ -301,9 +302,38 @@ test("a new Pi subscriber cannot receive a poll already in flight for another ta
   } finally { chats.unwatch(addr, a); chats.unwatch(addr, b); }
 });
 
+test("a core reconnect fences the old in-flight Pi overlay before publishing again", async () => {
+  const first = { ...snap, generation: "first", reset: true, before: 0, live: [] };
+  const final = { ...first, session: "switched", generation: "next", items: [
+    { id: "unique:0", role: "assistant", text: "New session", at: 44 },
+  ] };
+  const queries: unknown[] = [];
+  let delayed: ((value: unknown) => void) | undefined;
+  const { h } = remote((_op, query) => {
+    queries.push(query);
+    return queries.length === 1 ? first : queries.length === 2 ? new Promise((resolve) => { delayed = resolve; }) : final;
+  });
+  let emit: (event: { type: "reset" }) => void = () => {};
+  h.on = (cb) => { emit = cb; return () => true; };
+  const chats = new Chats(h);
+  const published: string[][] = [];
+  const page = (r: any) => published.push(r.conv.items.map((x: any) => x.text));
+  chats.watch(addr, page);
+  try {
+    await until(() => delayed);
+    expect(published).toEqual([["hi", "hello"]]);
+    emit({ type: "reset" });
+    delayed?.({ ...first, reset: false, state: "working", before: 2, items: [],
+      live: [{ id: "live:obsolete:0", role: "assistant", text: "Old overlay", at: 43 }] });
+    await until(() => published.some((words) => words.includes("New session")));
+    expect(queries[2]).toBeUndefined();
+    expect(published).toEqual([["hi", "hello"], ["New session"]]);
+  } finally { chats.unwatch(addr, page); }
+});
+
 test("a quoted web send is bound to the Pi snapshot the person saw", async () => {
-  const original = { ...snap, generation: "old", session: "previous" };
-  let active = { ...snap, generation: "new", session: "replacement" };
+  const original = { ...snap, generation: "old", session: "previous", reset: true, before: 0, live: [] };
+  let active = { ...original, generation: "new", session: "replacement" };
   const { h, compat, requests } = remote(() => active);
   compat.reader = (() => ({ kind: "pi", pi: original, conv: { items: [{ id: "old-quote", text: "only on the previous branch" }] } })) as any;
   compat.tasksFor = (() => [{ ref: "TASK-7", title: "Test task", state: "working", folder: "/repo", prompt: "task brief" }]) as any;

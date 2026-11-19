@@ -119,3 +119,56 @@ test("Pi discards delayed pages, results and snapshots after a branch, session o
   call.reply(newSession);
   expect(await refresh).toBeTrue();
 });
+
+test("a fresh snapshot after cursor expiry retains overlapping loaded history and its view", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  const middle = row("mid:0", "middle"), last = row("last:0", "last");
+  await pull(snap({ before: 1, items: [middle, last] }));
+  const view = reader.piView;
+  const earlier = reader.earlier(view);
+  take("page").reply(snap({ items: [row("old:0", "older")] }));
+  expect(await earlier).toBeTrue();
+  reader.refreshPi();
+  const pending = reader.pull();
+  const snapshot = take("snapshot");
+  expect(snapshot.query).toBeUndefined();
+  snapshot.reply(snap({ before: 2, leaf: "compact", items: [last, row("compact:0", "summary", "compaction")] }));
+  expect(await pending).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(reader.start).toBe(0);
+  expect(texts(reader)).toEqual(["older", "middle", "last", "summary"]);
+});
+
+test("a wide compaction can recover a small gap without losing the loaded window", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  await pull(snap({ items: [row("first:0", "original turn")] }));
+  const view = reader.piView;
+  const pending = reader.pull();
+  const chunk = { ...row("summary:0", "", "compaction"), part: 0 };
+  take("snapshot").reply(snap({ before: 2, leaf: "summary", items: [{ ...chunk, text: "continues", part: 1 }] }));
+  await Bun.sleep(0);
+  const gap = take("page");
+  expect(gap.query).toEqual({ generation: "first", before: 2 });
+  gap.reply(snap({ before: 1, leaf: "summary", items: [{ ...chunk, text: "A summary " }] }));
+  expect(await pending).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(reader.start).toBe(0);
+  expect(texts(reader)).toEqual(["original turn", "A summary continues"]);
+});
+
+test("an explicitly expired snapshot cursor retries without a cursor", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  await pull(snap({ state: "working", live: [row("live:old:0", "old overlay")] }));
+  const pending = reader.pull();
+  take("snapshot").reply({ ok: false, error: "stale_revision" });
+  // Wait for the retry or the original request to settle, whichever comes first.
+  await Promise.race([pending, Bun.sleep(0)]);
+  const fresh = take("snapshot");
+  expect(fresh.query).toBeUndefined();
+  fresh.reply(snap({ session: "another-session", items: [row("new:0", "new history")] }));
+  expect(await pending).toBeTrue();
+  expect(texts(reader)).toEqual(["new history"]);
+});

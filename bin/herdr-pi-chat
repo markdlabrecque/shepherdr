@@ -215,7 +215,7 @@ def result_for(args):
         before = result.get("before")
         if type(before) is int and 0 <= before < fields.get("before", 2**53):
             return {**head, "before": before, "items": visible_items(result.get("items"),
-                ("user", "assistant", "custom", "compaction", "branch", "tool", "result"))}
+                ("user", "assistant", "custom", "compaction", "branch", "context-edit", "tool", "result"))}
     raise Failure("invalid_response")
 
 

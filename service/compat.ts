@@ -107,12 +107,12 @@ const stepRow = (s: any, i: number) => ({ key: `${s.id ?? i}`, kind: STEP[s.kind
  *  only now, as the window's open row (mods/chat loadResults). */
 export async function activity(reader: any, id: string, view?: string): Promise<ActivityAnswer> {
   const gone = { error: "That turn isn't in the chat any more." };
-  const current = reader?.piView;
-  if (view !== undefined && view !== current) return gone;
+  const current = reader?.piView, barrier = reader?.piBarrier;
+  if ((view !== undefined && view !== current) || (current && reader.piFresh)) return gone;
   const x = (reader?.conv?.items ?? []).find((i: any) => i.id === id && i.kind === "tools");
   if (!x) return gone;
   const outs: Map<string, string> = await reader.results?.(x.steps).catch(() => new Map()) ?? new Map();
-  if (current && (reader.piView !== current || reader.piFresh)) return gone;
+  if (current && (reader.piView !== current || reader.piBarrier !== barrier || reader.piFresh)) return gone;
   return { steps: x.steps.map((s: any, i: number) => ({ id: `${s.id ?? i}`, kind: STEP[s.kind] ?? "other", tool: s.kind, at: 0, end: 1, title: s.line, doing: s.line, target: "", ...(outs.has(s.id) ? { out: outs.get(s.id) } : {}) })) };
 }
 

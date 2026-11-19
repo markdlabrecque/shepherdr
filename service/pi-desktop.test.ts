@@ -94,7 +94,7 @@ test("desktop Pi steering receipts stay pending until a new user record consumes
 });
 
 test("desktop paging keeps its anchor and drops a tool response from the previous Pi branch", async () => {
-  const root = { ...snapshot, generation: "original", reset: true, before: 2, live: [] };
+  const root = { ...snapshot, generation: "original", reset: true, before: 1, live: [] };
   const tool = { id: "call:0", role: "tool", text: "read", at: 1234 };
   const result = { id: "result:0", role: "result", text: "call:0", at: 1235 };
   let answer = { ...root, items: [tool, result] };
@@ -122,6 +122,14 @@ test("desktop paging keeps its anchor and drops a tool response from the previou
   self.loadResults(row, cx);
   const oldTool = jobs.pop();
   expect(deliverResult).toBeDefined();
+  const view = self.piView;
+  answer = { ...root, leaf: "compact", items: [tool, result,
+    { id: "compact:0", role: "compaction", text: "Summary", at: 1238 }] };
+  await pull.call(self, cx);
+  expect(self.piView).toBe(view);
+  expect(self.start).toBe(0);
+  expect(self.anchor.id).toBe(row.id);
+  expect(self.conv.items.at(-1)).toMatchObject({ kind: "brief", label: "Compaction summary" });
   answer = { ...root, generation: "fork", leaf: "other", before: 0,
     items: [{ id: "other:0", role: "assistant", text: "new branch", at: 1240 }] };
   await pull.call(self, cx);

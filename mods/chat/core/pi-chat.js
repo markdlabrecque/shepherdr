@@ -45,11 +45,29 @@ async function piRead(sh, addr, pid, op, query) {
 
 export async function piSnapshot(sh, addr, pid, cursor) {
   const s = await piRead(sh, addr, pid, "snapshot", cursor?.generation ? { generation: cursor.generation, leaf: cursor.leaf } : null);
-  return s && ["idle", "working", "blocked", "error"].includes(s.state) && Array.isArray(s.items) ? s : null;
+  if (s?.error === "stale_revision") return s;
+  return s && ["idle", "working", "blocked", "error"].includes(s.state) && Array.isArray(s.items)
+    && (s.leaf === null || typeof s.leaf === "string")
+    && (!s.generation || (Number.isSafeInteger(s.before) && s.before >= 0)) ? s : null;
 }
 export const piPage = (sh, addr, pid, generation, before) => piRead(sh, addr, pid, "page", { generation, before });
 export const piResults = (sh, addr, pid, generation, ids) => piRead(sh, addr, pid, "results", { generation, ids });
 export const samePiHistory = (a, b) => a && b && a.instance === b.instance && a.session === b.session && a.generation === b.generation;
+
+// A reset can mean the append cursor expired, not that the branch changed. Preserve a contiguous
+// loaded prefix. If there's a gap, use the new window and leave everything before it paginated.
+export function piCanKeepWindow(current, start, end, rows, next) {
+  if (!current?.generation || !samePiHistory(current, next) || next.before > end
+      || next.before + next.items.length < end) return false;
+  for (let i = Math.max(start, next.before); i < end; i++) {
+    const prior = rows[i - start], item = next.items[i - next.before];
+    if (prior?.id !== item?.id || prior?.part !== item?.part) return false;
+  }
+  return true;
+}
+export const piPageEndsAt = (page, end) => Array.isArray(page?.items) && Number.isSafeInteger(page.before)
+  && page.before >= 0 && page.before < end && page.before + page.items.length === end;
+
 // A client can submit this identity, but only the bridge can confirm that it is still active.
 export const piHistoryOf = (snapshot) => snapshot ? JSON.stringify([snapshot.instance, snapshot.session, snapshot.generation ?? null,
   snapshot.generation ? null : snapshot.leaf]) : null;

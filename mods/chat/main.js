@@ -1284,10 +1284,13 @@ export default class Chat extends View {
     if (this.kind === "pi" && this.piReader?.addr === this.addr) {
       const reader = this.piReader;
       if (!await reader.pull() || this.piReader !== reader || this.addr !== reader.addr) return;
+      if (this.piBarrier !== reader.piBarrier) {
+        this.piBarrier = reader.piBarrier;
+        this.results.clear();
+      }
       if (this.piView !== reader.piView) {
         this.piView = reader.piView;
         this.opened.clear();
-        this.results.clear();
         this.loadingEarlier = false;
         this.piEarlier = null;
         this.anchor = null;
@@ -1295,11 +1298,7 @@ export default class Chat extends View {
       }
       if (reader.pi) this.recoverPiOutgoing(reader.pi, cx);
       this.conv = reader.conv;
-      if (this.anchor) {
-        const id = this.anchor.id;
-        const final = this.conv?.items.find((x) => x.renderId && (x.renderId === id || id.startsWith(`${x.renderId}:`)));
-        if (final) this.anchor.id = final.id + id.slice(final.renderId.length);
-      }
+      if (this.anchor) this.anchor.id = reader.piAnchor(this.anchor.id);
       this.start = reader.start;
       this.settlePending();
       this.phase = reader.pi ? "ready" : "pi-unavailable";
@@ -1368,7 +1367,7 @@ export default class Chat extends View {
     cx.spawn(async (cx) => {
       try {
         if (reader) {
-          if (!await reader.earlier(view) || this.piReader !== reader || this.piView !== view || this.addr !== reader.addr) return;
+          if (!await reader.earlier(view) || this.piReader !== reader || reader.piView !== view || this.addr !== reader.addr) return;
           this.start = reader.start;
           this.conv = reader.conv;
           this.settlePending();
@@ -1380,7 +1379,7 @@ export default class Chat extends View {
           this.records = [...recs, ...this.records];
           this.rebuild();
         }
-        this.anchor = first ? { id: first, until: Date.now() + 3000 } : null;
+        this.anchor = first ? { id: reader ? reader.piAnchor(first) : first, until: Date.now() + 3000 } : null;
         this.reanchor = true;
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -1400,12 +1399,12 @@ export default class Chat extends View {
     for (const k of this.results.keys()) { if (this.results.size <= KEEP) break; this.results.delete(k); }
     const offs = [...new Set(want.map((s) => s.out))].slice(0, 40);
     const path = this.path;
-    const view = reader?.piView;
+    const barrier = reader?.piBarrier;
     cx.spawn(async (cx) => {
       try {
         if (reader) {
           const contents = await reader.results(want);
-          if (this.piReader !== reader || this.piView !== view || this.addr !== reader.addr) return;
+          if (this.piReader !== reader || reader.piBarrier !== barrier || this.addr !== reader.addr) return;
           for (const s of want) {
             if (contents.has(s.id)) this.results.set(s.id, contents.get(s.id));
             else this.results.delete(s.id);

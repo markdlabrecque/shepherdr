@@ -8,14 +8,30 @@ test("Pi notices are quiet and concurrent results pair by call entry and block, 
   const row = (id, role, text) => ({ id, role, text, at: 42 });
   const items = [row("1:0", "user", "original prompt"), row("2:0", "tool", "read"), row("2:1", "tool", "custom_tool"),
     row("3:0", "result", "2:1"), row("4:0", "compaction", "retained summary"),
-    row("5:0", "custom", "visible extension"), row("6:0", "thinking", "private thoughts")];
+    row("5:0", "custom", "visible extension"), row("6:0", "thinking", "private thoughts"),
+    row("7:0", "context-edit", "earlier model context changed")];
   const c = piConversation(items, { session: "s", generation: "g", state: "working" });
   expect(c.doing).toBe("Using read");
-  expect(c.items.map((x) => x.kind)).toEqual(["user", "tools", "tools", "brief", "brief"]);
+  expect(c.items.map((x) => x.kind)).toEqual(["user", "tools", "tools", "brief", "brief", "brief"]);
   expect(c.items[1].steps[0].out).toBeUndefined();
-  expect(c.items[2].steps[0]).toMatchObject({ id: "pi:s:g:2:1", kind: "tool", out: "2:1" });
+  expect(c.items[2].steps[0]).toMatchObject({ id: "pi:s:2:1", kind: "tool", out: "2:1" });
   expect(c.items[3]).toMatchObject({ label: "Compaction summary", text: "retained summary" });
-  expect(piConversation(items, { session: "s", generation: "g", state: "idle" }).doing).toBeNull();
+  expect(c.items[5]).toMatchObject({ label: "Context edit", text: "earlier model context changed" });
+  const fork = piConversation(items, { session: "s", generation: "fork", state: "idle" });
+  expect(fork.doing).toBeNull();
+  expect(fork.items.map((x) => x.id)).toEqual(c.items.map((x) => x.id));
+});
+
+test("Pi's final text keeps its entry identity and supersedes the matching provisional block", () => {
+  const c = piConversation([
+    { id: "persisted:1", role: "assistant", text: "authoritative", from: "live:r:1" },
+    { id: "live:r:1", role: "assistant", text: "old draft", provisional: true },
+    { id: "live:q:1", role: "assistant", text: "new draft", provisional: true },
+  ], { session: "s", generation: "g", state: "working" });
+  expect(c.items.map(({ id, text, renderId }) => [id, text, renderId])).toEqual([
+    ["pi:s:persisted:1", "authoritative", "pi:s:live:r:1"],
+    ["pi:s:live:q:1", "new draft", undefined],
+  ]);
 });
 
 test("Pi reconstructs adjacent pieces of a long message in the same text block", () => {

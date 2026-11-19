@@ -39,7 +39,7 @@ const sends = [];
 const ctx = {
   mode: "tui", model: {}, isIdle: () => idle,
   sessionManager: {
-    getSessionId: () => session, getLeafId: () => leaf, getSessionFile: () => file,
+    getSessionId: () => session, getLeafId: () => leaf, getLeafEntry: () => entries.get(leaf), getSessionFile: () => file,
     getBranch: branch, getEntries: () => [...entries.values()],
   },
 };
@@ -63,6 +63,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     await emit(idle ? "agent_settled" : "agent_start");
   }
   if (action === "run-ended") await emit("agent_end");
+  if (action === "turn-ended") await emit("turn_end");
   if (action === "leaf" || action === "tree") leaf = value;
   if (action === "tree") await emit("session_tree");
   if (action === "tree-start") await emit("session_before_tree");
@@ -82,12 +83,13 @@ for await (const line of createInterface({ input: process.stdin })) {
   if (action === "custom") {
     append(other("hidden", "custom_message", { display: false, content: "hidden custom secret" }));
     append(other("public", "custom_message", { display: true, content: [text("visible extension note")], details: "details secret" }));
-    append(other("book", "context_edit", { targetId: "assistant-1", content: [text("projection secret")] }));
+    append(other("book", "context_edit", { targetId: "assistant-1", replacement: { content: [text("projection secret")] } }));
     append(other("unknown", "future_entry", { content: "unknown secret" }));
   }
   if (action === "compact") append(other("compact", "compaction", { summary: "what happened before compaction", firstKeptEntryId: leaf }));
   if (action === "branch-summary") append(other("branch-summary", "branch_summary", { summary: "why this branch exists" }));
-  if (action === "stream") {
+  if (action === "stream" || action === "new-stream") {
+    if (action === "new-stream") live = undefined;
     if (idle) {
       idle = false;
       await emit("agent_start");
@@ -116,7 +118,12 @@ for await (const line of createInterface({ input: process.stdin })) {
     writeFileSync(`${file}.tmp`, readFileSync(file));
     renameSync(`${file}.tmp`, file);
   }
+  if (action === "rewrite-file") writeFileSync(file, readFileSync(file, "utf8").replace("reply", "other"));
   if (action === "truncate-file") truncateSync(file, 5);
+  if (action === "replace-leaf-entry") {
+    const prior = entries.get(leaf);
+    entries.set(leaf, { ...prior, message: { ...prior.message, content: [text(value)] } });
+  }
   if (action === "shutdown" || action === "reload") await emit("session_shutdown");
   if (action === "reload") await emit("session_start");
   console.log(JSON.stringify(sends));

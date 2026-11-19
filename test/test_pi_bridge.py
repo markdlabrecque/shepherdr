@@ -341,16 +341,61 @@ class Bridge(Scratch):
         replaced = self.cli("snapshot", self.cursor(first))
         self.assertTrue(replaced["reset"])
         self.assertNotEqual(replaced["generation"], first["generation"])
+        self.control("rewrite-file")
+        rewritten = self.cli("snapshot", self.cursor(replaced))
+        self.assertTrue(rewritten["reset"])
+        self.assertNotEqual(rewritten["generation"], replaced["generation"])
+        # Pi's active manager still owns the branch; the bridge does not pretend to resume an external file.
+        self.assertEqual(rewritten["items"], replaced["items"])
         self.control("truncate-file")
-        self.assertNotEqual(self.cli("snapshot")["generation"], replaced["generation"])
+        self.assertNotEqual(self.cli("snapshot")["generation"], rewritten["generation"])
         self.control("custom")
         self.control("compact")
         self.control("branch-summary")
         items = self.cli("snapshot")["items"]
         self.assertEqual([(x["role"], x["text"]) for x in items], [
             ("user", "hello\nworld"), ("assistant", "reply!"), ("custom", "visible extension note"),
+            ("context-edit", "Earlier content changed in Pi’s context. The chat is unchanged."),
             ("compaction", "what happened before compaction"), ("branch", "why this branch exists"),
         ])
+
+    def test_ephemeral_branch_detects_replaced_entries_even_with_same_leaf(self):
+        self.control("leaf", "assistant-1")
+        first = self.cli("snapshot")
+        self.control("replace-leaf-entry", "replacement")
+        current = self.cli("snapshot", self.cursor(first))
+        self.assertTrue(current["reset"])
+        self.assertEqual(current["leaf"], first["leaf"])
+        self.assertNotEqual(current["generation"], first["generation"])
+        self.assertEqual(current["items"][-1]["text"], "replacement")
+
+    def test_final_is_linked_to_its_stream_even_if_turn_ends_between_polls(self):
+        self.control("stream", "draft before tools")
+        first = self.cli("snapshot")
+        self.control("final", "final after stream")
+        self.control("turn-ended")
+        self.control("new-stream", "continuation draft")
+        current = self.cli("snapshot", self.cursor(first))
+        self.assertEqual(current["items"][0]["from"], first["live"][0]["id"])
+        self.assertEqual(current["items"][0]["text"], "final after stream")
+        self.assertEqual([r["text"] for r in current["live"]], ["continuation draft"])
+        self.assertNotEqual(current["live"][0]["id"], first["live"][0]["id"])
+
+    def test_late_stream_update_does_not_reappear_after_navigation_or_session_change(self):
+        self.cli("snapshot")
+        self.control("stream", "old draft")
+        streaming = self.cli("snapshot")
+        self.control("tree", "user-1")
+        moved = self.cli("snapshot", self.cursor(streaming))
+        self.assertTrue(moved["reset"])
+        self.assertEqual(moved["live"], [])
+        self.control("stream", "late update from old draft")
+        self.assertEqual(self.cli("snapshot", self.cursor(moved))["live"], [])
+        self.control("session", "second-session")
+        self.control("new-stream", "new session draft")
+        switched = self.cli("snapshot", self.cursor(moved))
+        self.assertTrue(switched["reset"])
+        self.assertEqual([x["text"] for x in switched["live"]], ["new session draft"])
 
     def test_wire_bounds_pid_and_shutdown(self):
         instance = self.cli("snapshot")["instance"]
@@ -429,6 +474,32 @@ class InteractivePi(Scratch):
         self.assertEqual(pi.proc.wait(timeout=5), 0)
         self.assertEqual(list(self.runtime.iterdir()), [])
 
+    def test_resumed_custom_file_uses_only_the_active_parent_chain(self):
+        path = self.runtime.parent / "custom session.jsonl"
+        timestamp = "2025-06-01T12:00:00.123Z"
+
+        def user(entry_id, parent_id, content):
+            return {"type": "message", "id": entry_id, "parentId": parent_id, "timestamp": timestamp,
+                    "message": {"role": "user", "content": content, "timestamp": 1748779200123}}
+
+        entries = [
+            {"type": "session", "version": 3, "id": "a56eaab9-827c-467c-9205-bffba198ec6c",
+             "timestamp": timestamp, "cwd": str(path.parent)},
+            user("old-root", None, "Not on the active branch"),
+            user("new-root", None, "Original visible prompt"),
+            user("side", "new-root", "Not on the active fork"),
+            {"type": "context_edit", "id": "edit", "parentId": "new-root", "timestamp": timestamp,
+             "targetId": "new-root", "replacement": {"content": "Private model-only replacement"}},
+            {"type": "compaction", "id": "keep", "parentId": "edit", "timestamp": timestamp,
+             "firstKeptEntryId": "new-root", "tokensBefore": 120, "summary": "Visible compacted summary"},
+        ]
+        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries) + '{"type":"mess')
+        self.start_pi("-e", ROOT / "integrations/pi/shepherdr.ts", "--session", path)
+        snap = self.settled_reply("Visible compacted summary")
+        self.assertEqual([r["id"] for r in snap["items"]], ["new-root:0", "edit:0", "keep:0"])
+        self.assertEqual(snap["items"][0]["text"], "Original visible prompt")
+        self.assertNotIn("Private model-only replacement", json.dumps(snap))
+
     def test_send_now_waits_during_manual_compaction_without_recording_a_receipt(self):
         pi = self.start_pi("-e", ROOT / "integrations/pi/shepherdr.ts", "before-compact",
                            settings={"compaction": {"enabled": False, "keepRecentTokens": 1}})
@@ -446,7 +517,13 @@ class InteractivePi(Scratch):
         fields = dict(identity, id="compact-follow-up", body="after-compact", mode="now")
         self.assertEqual(self.cli("send", fields), {"ok": True, "status": "waiting"})
         gate.unlink()
-        self.settled_reply("Fixture compaction summary")
+        compacted = self.settled_reply("Fixture compaction summary")
+        self.assertEqual(compacted["generation"], snapshot["generation"])
+        self.assertEqual([(r["role"], r["text"]) for r in compacted["items"]], [
+            ("user", "before-compact"), ("assistant", "Fixture echo: [before-compact]"),
+            ("user", "last-before-compact"), ("assistant", "Fixture echo: [last-before-compact]"),
+            ("compaction", "Fixture compaction summary"),
+        ])
         self.assertEqual(self.cli("send", fields), {"ok": True, "status": "accepted"})
         pi.wait_for("Fixture echo: [after-compact]")
         rows = self.settled_reply("Fixture echo: [after-compact]")["items"]

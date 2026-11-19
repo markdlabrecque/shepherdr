@@ -73,10 +73,21 @@ export class Chats {
     const io = { sh: (script: string, args: string[], on: string | null) => sh(hub, script, args, on) };
     this.io = io;
     hub.on((e) => {
-      if (e.type === "reset") fg.clear();
+      if (e.type === "reset") {
+        fg.clear();
+        for (const [addr, f] of this.followed) {
+          if (f.reader.kind !== "pi") continue;
+          f.reader.refreshPi();
+          if (f.pages.size) this.nudge(addr);
+        }
+      }
       if (!("terminal" in e) || !e.terminal) return;
-      if (["foreground", "restarted", "finished", "removed", "lost"].includes(e.type)) fg.delete(e.terminal);
-      if (this.followed.has(e.terminal)) void this.tick(e.terminal);
+      const f = this.followed.get(e.terminal);
+      if (["foreground", "restarted", "finished", "removed", "lost"].includes(e.type)) {
+        fg.delete(e.terminal);
+        if (f?.reader.kind === "pi") f.reader.refreshPi();
+      }
+      if (f) void this.tick(e.terminal);
     });
     setInterval(() => { for (const a of this.followed.keys()) void this.tick(a); }, 1000);
   }
@@ -167,8 +178,10 @@ export class Chats {
     f.again = false;
     f.last = Date.now();
     const awaiting = [...(f.awaiting ?? [])];
+    const barrier = f.reader.piBarrier;
     try {
       const t = await withForeground(addr, this.hub.terminals.get(addr));
+      if (barrier !== f.reader.piBarrier) return;
       let changed = await f.reader.locate(t);
       if (await f.reader.pull()) changed = true;
       if (await f.reader.lookJobs()) changed = true;

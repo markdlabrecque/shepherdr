@@ -608,11 +608,13 @@ export function claudeSwitch(text) {
 
 export function piConversation(items, { session, generation, state } = {}) {
   const conv = new Conversation("pi");
-  const prefix = generation ? `pi:${encodeURIComponent(session)}:${generation}:` : "";
+  // A branch revision fences reads, not the identities of entries shared by two branches.
+  const prefix = generation ? `pi:${encodeURIComponent(session)}:` : "";
+  const finalized = new Set(items.filter((x) => !x?.provisional && x?.from).map((x) => x.from));
   const calls = new Map(), open = new Map();
   const blocks = [];
   for (const x of items) {
-    if (typeof x?.id !== "string" || typeof x.text !== "string") continue;
+    if (typeof x?.id !== "string" || typeof x.text !== "string" || (x.provisional && finalized.has(x.id))) continue;
     const tail = blocks.at(-1);
     if (tail && tail.id === x.id && x.part !== undefined && tail.part + 1 === x.part) {
       tail.text += x.text;
@@ -636,8 +638,9 @@ export function piConversation(items, { session, generation, state } = {}) {
       const step = calls.get(x.text);
       if (step) step.out = x.text;
       open.delete(x.text);
-    } else if (x.role === "compaction" || x.role === "branch" || x.role === "custom") {
-      const label = x.role === "compaction" ? "Compaction summary" : x.role === "branch" ? "Branch summary" : "Pi extension message";
+    } else if (x.role === "compaction" || x.role === "branch" || x.role === "context-edit" || x.role === "custom") {
+      const label = x.role === "compaction" ? "Compaction summary" : x.role === "branch" ? "Branch summary"
+        : x.role === "context-edit" ? "Context edit" : "Pi extension message";
       if (x.text.trim()) conv.push({ kind: "brief", id, text: x.text, at, label });
     }
   }
