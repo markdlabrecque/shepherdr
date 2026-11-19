@@ -1,4 +1,8 @@
-"""The executable and Pi extension talk over real sockets in a private scratch registry."""
+"""The executable and Pi extension talk over real sockets in a private scratch registry.
+
+With Pi 1.5.2 and its Node runtime on PATH, also exercise real interactive Pi:
+SHEPHERDR_TEST_PI=1 python3 -m unittest discover -s test -p test_pi_bridge.py
+"""
 import home_guard  # noqa: F401
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -9,6 +13,7 @@ import socket
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -180,6 +185,7 @@ class Bridge(Scratch):
         self.assertEqual(self.cli("snapshot")["state"], "working")
         self.assertEqual(self.cli("send", held), {"ok": True, "status": "waiting"})
         self.assertEqual(self.control("idle", False), [])
+        self.control("run-ended")  # low-level end does not settle a retry or continuation
         self.assertEqual(self.cli("send", now), {"ok": True, "status": "queued"})
         self.assertEqual(self.cli("send", now), {"ok": True, "status": "queued"})
         self.assertEqual(self.control("idle", True), [
@@ -360,3 +366,90 @@ class Bridge(Scratch):
         self.assertFalse(self.registry.exists())
         self.assertFalse(self.address.exists())
         self.assertEqual(self.cli("snapshot")["error"], "not_available")
+
+
+@unittest.skipUnless(os.environ.get("SHEPHERDR_TEST_PI") == "1", "set SHEPHERDR_TEST_PI=1 to exercise installed Pi")
+class InteractivePi(Scratch):
+    def start_pi(self, *args, **kwargs):
+        from pi_pty import PiPty
+
+        executable = shutil.which("pi")
+        self.assertIsNotNone(executable, "SHEPHERDR_TEST_PI=1 requires Pi on PATH")
+        pi = PiPty(executable, self.runtime.parent, self.runtime, *args, **kwargs)
+        self.addCleanup(pi.close)
+        self.pid = pi.proc.pid
+        self.env = pi.env
+        return pi
+
+    def settled_reply(self, text):
+        deadline = time.monotonic() + 5
+        while True:
+            snapshot = self.cli("snapshot")
+            items = snapshot.get("items", [])
+            if snapshot.get("state") == "idle" and items and items[-1]["text"] == text:
+                return snapshot
+            if time.monotonic() >= deadline:
+                self.fail(f"Pi did not settle with reply {text!r}: {snapshot!r}")
+            time.sleep(0.02)
+
+    def test_reload_and_bridge_follow_up_keep_the_terminal_usable(self):
+        pi = self.start_pi("terminal-first")
+        pi.wait_for("Fixture echo: [terminal-first]")
+        self.assertEqual(self.cli("snapshot")["error"], "not_available")
+
+        # Reproduce the installer's link while interactive Pi already has a conversation.
+        (pi.extensions / "shepherdr.ts").symlink_to(ROOT / "integrations/pi/shepherdr.ts")
+        pi.send("/reload")
+        pi.wait_for("Reloaded keybindings, extensions")
+        first = self.cli("snapshot")
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first["state"], "idle")
+        self.assertEqual(self.cli("snapshot", pid=os.getpid())["error"], "not_available")
+        self.assertEqual([(item["role"], item["text"]) for item in first["items"]], [
+            ("user", "terminal-first"), ("assistant", "Fixture echo: [terminal-first]"),
+        ])
+
+        identity = {key: first[key] for key in ("instance", "session", "leaf", "generation")}
+        fields = dict(identity, id="follow-up", body="bridge-next", mode="now")
+        self.assertEqual(self.cli("send", fields), {"ok": True, "status": "accepted"})
+        self.assertEqual(self.cli("send", fields), {"ok": True, "status": "accepted"})
+        pi.wait_for("Fixture echo: [bridge-next]")
+        self.settled_reply("Fixture echo: [bridge-next]")
+        pi.send("terminal-after-bridge")
+        pi.wait_for("Fixture echo: [terminal-after-bridge]")
+        final = self.settled_reply("Fixture echo: [terminal-after-bridge]")
+        self.assertEqual((final["instance"], final["session"]), (first["instance"], first["session"]))
+        self.assertNotEqual(final["leaf"], first["leaf"])
+        self.assertEqual([(item["role"], item["text"]) for item in final["items"]], [
+            ("user", "terminal-first"), ("assistant", "Fixture echo: [terminal-first]"),
+            ("user", "bridge-next"), ("assistant", "Fixture echo: [bridge-next]"),
+            ("user", "terminal-after-bridge"), ("assistant", "Fixture echo: [terminal-after-bridge]"),
+        ])
+        pi.send("/quit")
+        self.assertEqual(pi.proc.wait(timeout=5), 0)
+        self.assertEqual(list(self.runtime.iterdir()), [])
+
+    def test_send_now_waits_during_manual_compaction_without_recording_a_receipt(self):
+        pi = self.start_pi("-e", ROOT / "integrations/pi/shepherdr.ts", "before-compact",
+                           settings={"compaction": {"enabled": False, "keepRecentTokens": 1}})
+        self.settled_reply("Fixture echo: [before-compact]")
+        pi.send("last-before-compact")
+        self.settled_reply("Fixture echo: [last-before-compact]")
+        gate = self.runtime.parent / "fixture-hold-compaction"
+        gate.touch()
+        pi.send("/compact")
+        pi.wait_for("Fixture compaction held")
+
+        snapshot = self.cli("snapshot")
+        self.assertEqual(snapshot["state"], "working")
+        identity = {key: snapshot[key] for key in ("instance", "session", "leaf", "generation")}
+        fields = dict(identity, id="compact-follow-up", body="after-compact", mode="now")
+        self.assertEqual(self.cli("send", fields), {"ok": True, "status": "waiting"})
+        gate.unlink()
+        self.settled_reply("Fixture compaction summary")
+        self.assertEqual(self.cli("send", fields), {"ok": True, "status": "accepted"})
+        pi.wait_for("Fixture echo: [after-compact]")
+        rows = self.settled_reply("Fixture echo: [after-compact]")["items"]
+        self.assertEqual([(r["role"], r["text"]) for r in rows[-2:]], [
+            ("user", "after-compact"), ("assistant", "Fixture echo: [after-compact]"),
+        ])
