@@ -20,7 +20,7 @@ export function withoutPiHistory(kept: Kept): Kept {
   const pi = new Set(Object.entries(kept.chats ?? {}).filter(([, chat]) => chat.cli === 'pi').map(([key]) => key))
   if (!pi.size) return kept
   const chats = Object.fromEntries(Object.entries(kept.chats ?? {}).filter(([key]) => !pi.has(key)))
-  const reply = kept.reply && Object.fromEntries(Object.entries(kept.reply).filter(([key]) => !pi.has(key)))
+  const reply = Object.fromEntries(Object.entries(kept.reply ?? {}).filter(([key]) => !pi.has(key)))
   return { ...kept, chats, reply }
 }
 

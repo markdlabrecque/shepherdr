@@ -9,3 +9,8 @@ test('a build reload keeps drafts but waits for fresh Pi history', () => {
   const kept = { chats: { pi, claude }, reply: { pi: quote('pi'), claude: quote('claude') }, text: { pi: 'my draft' } }
   expect(withoutPiHistory(kept)).toEqual({ chats: { claude }, reply: { claude: quote('claude') }, text: kept.text })
 })
+
+test('a Pi reload cache with no saved quote keeps an empty reply map', () => {
+  const pi: Chat = { key: 'pi', cli: 'pi', messages: [] }
+  expect(withoutPiHistory({ chats: { pi } })).toEqual({ chats: {}, reply: {} })
+})
