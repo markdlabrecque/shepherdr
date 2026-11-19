@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { AGENT_PATH, CLEAN_ENV, cleanCommand } from "./clean-env.js";
 
@@ -17,6 +17,63 @@ test("an Assistant's command runs without a parent Claude Code session's markers
 test("the agent is exec'd once, whether the template's command had exec or not", () => {
   expect(cleanCommand("claude --model opus")).toBe(`${CLEAN_ENV} ${AGENT_PATH} exec claude --model opus`);
   expect(cleanCommand("exec claude")).toBe(`${CLEAN_ENV} ${AGENT_PATH} exec claude`);
+});
+
+test("a minimal holder PATH finds managed Pi while keeping an existing Pi first", () => {
+  const home = mkdtempSync(`${tmpdir()}/clean-env-pi-`);
+  try {
+    const managed = `${home}/.pi/agent/bin`;
+    const own = `${home}/own`;
+    for (const dir of [managed, own]) mkdirSync(dir, { recursive: true });
+    writeFileSync(`${managed}/pi`, '#!/bin/sh\necho managed "$@"\n', { mode: 0o755 });
+    writeFileSync(`${own}/pi`, '#!/bin/sh\necho own "$@"\n', { mode: 0o755 });
+    for (const [path, expected] of [["/usr/bin:/bin", "managed"], [`${own}:/usr/bin:/bin`, "own"]]) {
+      const r = Bun.spawnSync(["/bin/sh", "-c", cleanCommand("pi --model test/model")], { env: { HOME: home, PATH: path } });
+      expect([r.exitCode, r.stdout.toString().trim()]).toEqual([0, `${expected} --model test/model`]);
+    }
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("an Assistant and its subprocesses find nvm's selected or default node and npm tools", () => {
+  const home = mkdtempSync(`${tmpdir()}/clean-env-nvm-`);
+  try {
+    // Isolate host-wide node installs, including /usr/bin/node on Linux. Keep just the shell utilities we need.
+    const tools = `${home}/tools`;
+    mkdirSync(tools);
+    for (const name of ["sh", "env", "sed", "grep", "echo"]) symlinkSync(Bun.which(name), `${tools}/${name}`);
+    const command = (cmd) => cleanCommand(cmd).replace(":/opt/homebrew/bin:/usr/local/bin", "");
+    // Spaces exercise quoting; a newer installed version must not displace the selected default.
+    for (const root of [`${home}/.nvm`, `${home}/custom nvm`]) {
+      for (const version of ["v24", "v25"]) {
+        const bin = `${root}/versions/node/${version}/bin`;
+        mkdirSync(bin, { recursive: true });
+        writeFileSync(`${bin}/node`, `#!/bin/sh\necho ${version} "$@"\n`, { mode: 0o755 });
+        writeFileSync(`${bin}/gh-axi`, '#!/usr/bin/env node\n', { mode: 0o755 });
+      }
+      // Stand-in for nvm's shell API; startup must request the default, not scan versions or load profiles.
+      writeFileSync(`${root}/nvm.sh`, 'nvm() { [ "$1 $2" = "which default" ] || return 1; printf "%s/versions/node/v24/bin/node\\n" "${NVM_DIR:-$HOME/.nvm}"; }\n');
+      for (const selected of [false, true]) {
+        const env = { HOME: home, PATH: tools, NVM_DIR: root,
+          ...(selected ? { NVM_BIN: `${root}/versions/node/v25/bin` } : {}) };
+        const r = Bun.spawnSync(["/bin/sh", "-c", command("sh -c 'node --version; gh-axi'")], { env });
+        const version = selected ? "v25" : "v24";
+        expect([r.exitCode, r.stdout.toString().trim()]).toEqual([0, `${version} --version\n${version} ${root}/versions/node/${version}/bin/gh-axi`]);
+      }
+      const own = `${home}/own`;
+      mkdirSync(own, { recursive: true });
+      writeFileSync(`${own}/node`, '#!/bin/sh\necho inherited\n', { mode: 0o755 });
+      const r = Bun.spawnSync(["/bin/sh", "-c", command("node")], {
+        env: { HOME: home, PATH: `${own}:${tools}`, NVM_DIR: root },
+      });
+      expect([r.exitCode, r.stdout.toString().trim()]).toEqual([0, "inherited"]);
+    }
+    // With no explicit NVM_DIR, use ~/.nvm; an absent default must remain harmless, including under set -e.
+    const env = { HOME: home, PATH: tools };
+    expect(Bun.spawnSync(["/bin/sh", "-c", command("gh-axi")], { env }).stdout.toString()).toContain("v24");
+    writeFileSync(`${home}/.nvm/nvm.sh`, "nvm() { return 3; }\n");
+    const r = Bun.spawnSync(["/bin/sh", "-ec", command("echo started")], { env });
+    expect([r.exitCode, r.stdout.toString().trim()]).toEqual([0, "started"]);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
 test("a holder started over ssh (PATH only /usr/bin:/bin) still finds an agent in ~/.local/bin (GitHub #839)", () => {

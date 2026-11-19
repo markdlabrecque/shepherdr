@@ -33,8 +33,8 @@ export function runsCommand(argv: unknown): boolean {
 }
 
 /** Runs a command on a machine through herdr-core (null: here). Output comes back base64. */
-export async function exec(hub: Hub, argv: string[], on: string | null = null, timeout = 60) {
-  const r = await hub.call<{ code: number; stdout: string; stderr: string }>("machine.exec", { argv, ...(on ? { on } : {}), timeout }, (timeout + 5) * 1000);
+export async function exec(hub: Hub, argv: string[], on: string | null = null, timeout = 60, input?: string) {
+  const r = await hub.call<{ code: number; stdout: string; stderr: string }>("machine.exec", { argv, ...(on ? { on } : {}), timeout, ...(input === undefined ? {} : { input: Buffer.from(input).toString("base64") }) }, (timeout + 5) * 1000);
   const text = (b: string) => Buffer.from(b ?? "", "base64").toString("utf8");
   return { code: r.code, stdout: text(r.stdout), stderr: text(r.stderr) };
 }

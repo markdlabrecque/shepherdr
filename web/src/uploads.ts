@@ -9,7 +9,7 @@ export const GIVE_UP = 10 * 60_000
 
 /** an answer from Shepherdr that said no, with its status: 5xx from a proxy in front is the network, not a no */
 export class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  constructor(public status: number, message: string, public sendRefusal?: 'unconfirmed' | 'refused') {
     super(message)
   }
 }

@@ -5,10 +5,10 @@ import clsx from 'clsx'
 import * as SL from '@core/slash.js'
 const { typing: slashTyping, match: slashMatch } = SL as any
 import { openAccept } from '@client/screens/Accept.tsx'
-import { createContext, Fragment, memo, useContext, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ComponentType, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type RefObject } from 'react'
+import { Component, createContext, Fragment, memo, useContext, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ComponentType, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type RefObject } from 'react'
 import { act, chatName, definePlugin, getDraft, getState, goChat, has, holdReload, openArtifact, openItem, openNeeds, openTask, registry, setDraft, setOutbox, setUI, taskOf, useDraft, useSnap, useStore, useUI, type UI } from '@client/kernel.ts'
-import { anchorOf, keyOf, partsOf, placesOf, priorOf, reasonOf, SEND_TIMEOUT, type Outgoing } from '@client/outbox.ts'
-import { dropFiles, keepFile, keptFile, postFile, retrying, sweepFiles } from '@client/uploads.ts'
+import { anchorOf, keyOf, partsOf, placesOf, priorOf, reasonOf, sameOutgoingHistory, SEND_TIMEOUT, unconfirmedPi, type Outgoing } from '@client/outbox.ts'
+import { dropFiles, keepFile, keptFile, postFile, retrying, sweepFiles, transient, HttpError } from '@client/uploads.ts'
 import { AlertIcon, BackIcon, CameraIcon, CheckIcon, CopyIcon, Count, DeleteIcon, dimmed, Dot, DownIcon, DownloadIcon, Empty, field, FileIcon, ic, IconButton, KeyIcon, LinkButton, LiveWave, MachineIcon, Menu, MenuItem, MenuSeparator, MenuSetting, MicIcon, ModeIcon, MoreIcon, NextIcon, PageIcon, PlanIcon, PlusIcon, Primary, QuestionIcon, ReplyIcon, RestartIcon, roundBtn, SearchIcon, SecretField, Sent, SmileIcon, Tab, Tabs, TextBox, UpIcon, useElapsed, XIcon } from '@client/ui.tsx'
 import { canDictate, dictate, dictSample, type Dictation } from '@client/dictation.ts'
 import { extOf, isImage, isVideo } from '@shared/files.ts'
@@ -106,7 +106,7 @@ function Bubble({ msg, chat, from, out, last, pics, images, writing }: { msg: Me
     />
   ) : null
   // its band: what you just sent gets one once it's in the conversation; the agent's newest waits while it writes
-  const band = msg.text && !msg.card && !art && !out && !writing && !msg.waiting ? <Band msg={msg} chat={chat.key} cli={chat.cli !== ''} /> : null
+  const band = msg.text && !msg.card && !art && !out && !writing && !msg.waiting ? <Band msg={msg} chat={chat.key} cli={chat.cli !== '' && chat.cli !== 'pi'} /> : null
   const unit = (anchor: ReactNode, quoted?: boolean) => (
     <div
       data-msg={msg.id}
@@ -241,14 +241,22 @@ const heldOut = (o: Outgoing) => o.state !== 'failed' && (o.hold || o.waitsFor =
 /** the window's held messages (mods/chat queued()): a row each over the box, a clock, its words, "Queued · Sends when
  *  the agent is free", Send now, Edit (back in the box), × (taken back) */
 function Held({ chatKey }: { chatKey: string }) {
-  const msgs = useStore((s) => s.chats[chatKey]?.messages)
+  const pi = useStore((s) => s.chats[chatKey]?.cli === 'pi')
+  const piBlocked = useStore((s) => s.chats[chatKey]?.cli === 'pi' && s.chats[chatKey]?.blocked !== undefined)
+  const chat = useStore((s) => s.chats[chatKey])
+  const msgs = chat?.messages
   const outbox = useStore((s) => s.outbox)
   const rows = new Map<string, { cid: string; text: string; files: string[] }>()
   for (const m of msgs ?? []) if (isHeld(m)) rows.set(m.cid!, { cid: m.cid!, text: m.text ?? '', files: m.file ? [m.file.name] : [] })
-  for (const o of outbox) if (o.chat === chatKey && heldOut(o) && !rows.has(o.cid)) rows.set(o.cid, { cid: o.cid, text: o.text, files: o.files.map((f) => f.name) })
+  for (const o of outbox) if (o.chat === chatKey && sameOutgoingHistory(o, chat) && heldOut(o) && !rows.has(o.cid)) rows.set(o.cid, { cid: o.cid, text: o.text, files: o.files.map((f) => f.name) })
   if (!rows.size) return null
   const ghost = 'flex h-[22px] shrink-0 items-center rounded-[6px] px-2 text-[0.75rem] font-medium text-fg2 hover:bg-hover hover:text-fg phone:h-9'
-  const take = (cid: string, then?: () => void) => void act({ type: 'held-drop', cid } as never).then(() => { removeOut(cid); then?.() }, () => { removeOut(cid); then?.() })
+  const take = (cid: string, then?: () => void) => {
+    const taken = () => { removeOut(cid); then?.() }
+    const outgoing = getState().outbox.find((o) => o.cid === cid)
+    if (pi && outgoing?.state === 'sending' && !outgoing.piInFlight) return taken()
+    void act({ type: 'held-drop', cid } as never).then(taken, (e: Error) => { if (pi) alert(e.message); else taken() })
+  }
   return (
     <div className="flex flex-col gap-1">
       {[...rows.values()].map((r) => (
@@ -258,7 +266,7 @@ function Held({ chatKey }: { chatKey: string }) {
             <span className="truncate text-[0.78125rem] text-fg">{r.text || r.files.join(', ')}</span>
             <span className="truncate text-[0.75rem] text-fg3">{WORDS.queued}</span>
           </span>
-          <button type="button" className={ghost} onClick={() => void act({ type: 'held-now', cid: r.cid } as never).catch(() => undefined)}>{WORDS.sendNow}</button>
+          {!piBlocked && <button type="button" className={ghost} onClick={() => void act({ type: 'held-now', cid: r.cid } as never).catch((e: Error) => { if (pi) alert(e.message) })}>{WORDS.sendNow}</button>}
           <button type="button" className={ghost} onClick={() => take(r.cid, () => { const now = (getDraft(chatKey) ?? '').trim(); setDraft(chatKey, now ? `${r.text}\n\n${now}` : r.text); setUI({ focus: chatKey }) })}>Edit</button>
           <button type="button" aria-label="Remove" className="grid size-[22px] shrink-0 place-items-center rounded-[6px] text-fg3 hover:bg-hover hover:text-fg phone:size-9" onClick={() => take(r.cid)}><XIcon className="size-3" /></button>
         </div>
@@ -305,14 +313,14 @@ function NotSent({ out, className }: { out: Outgoing; className?: string }) {
       ) : (
         <span className="flex items-center gap-1.5">
           <AlertIcon className="size-3.5 shrink-0" />
-          Not sent. {out.error}
+          {out.ambiguous ? out.error : `Not sent. ${out.error ?? ''}`}
         </span>
       )}
       <span className="flex items-center gap-1.5 whitespace-nowrap">
-        <button type="button" className={btn} onClick={() => retry(out.cid)}>
-          Retry
-        </button>
-        <span aria-hidden="true" className="text-fg3">·</span>
+        {!out.noRetry && <>
+          <button type="button" className={btn} onClick={() => retry(out.cid)}>Retry</button>
+          <span aria-hidden="true" className="text-fg3">·</span>
+        </>}
         <button type="button" className={btn} onClick={() => removeOut(out.cid)}>
           Remove
         </button>
@@ -1206,11 +1214,11 @@ const Messages = memo(function Messages({ chat, from }: { chat: Chat; from: stri
   type Item = { at: number; msg: Message; out?: Outgoing; last?: boolean } | { at: number; album: Message[]; out?: Outgoing; last?: boolean }
   // held messages aren't in the conversation yet: they are rows over the box (Held), as the window's
   const shown: Item[] = chat.messages.filter((m) => !isHeld(m)).map((msg) => ({ at: msg.at ?? 0, msg }))
-  shown.sort((a, b) => a.at - b.at)
+  if (chat.cli !== 'pi') shown.sort((a, b) => a.at - b.at)
   // what you just sent, in one list with the rest: right after what was last when you sent it, so newer messages come
   // under it and the chat keeps the order things were sent in (SHEP-93: one stuck at the bottom under everything
   // newer). When it comes back it keeps its place in the list, so nothing is drawn again (a picture doesn't load twice)
-  const mine = outbox.filter((o) => o.chat === chat.key && !heldOut(o))
+  const mine = outbox.filter((o) => o.chat === chat.key && sameOutgoingHistory(o, chat) && !heldOut(o))
   const places = placesOf(shown.map((it) => ('msg' in it ? { id: it.msg.id, cid: it.msg.cid } : { id: '' })), mine)
   const extra = new Map<number, Item[]>()
   for (const out of mine) {
@@ -1298,7 +1306,7 @@ const Messages = memo(function Messages({ chat, from }: { chat: Chat; from: stri
                 <div data-quiet className="flex w-full flex-col">
                   {it.quiet.map((m) => (
                     <div key={m.id} data-msg={m.id} data-chat={chat.key} className="w-full">
-                      {m.activity ? <TurnLine a={m.activity} chat={chat.key} /> : m.brief ? <BriefRow msg={m} /> : m.news ? <NewsRow msg={m} /> : m.ended ? <EndedRow msg={m} /> : m.pilot ? <PilotRow msg={m} /> : <PublishingRow />}
+                      {m.activity ? <TurnLine a={m.activity} chat={chat.key} view={chat.piView} /> : m.brief ? <BriefRow msg={m} /> : m.news ? <NewsRow msg={m} /> : m.ended ? <EndedRow msg={m} /> : m.pilot ? <PilotRow msg={m} /> : <PublishingRow />}
                     </div>
                   ))}
                 </div>
@@ -1311,7 +1319,7 @@ const Messages = memo(function Messages({ chat, from }: { chat: Chat; from: stri
               ) : it.msg.images ? (
                 <ImagesLine n={it.msg.images} />
               ) : (
-                <Bubble msg={it.msg} chat={chat} from={from} out={it.out} last={it.last} pics={pics.get(it.msg)} images={imgLines.get(it.msg)} writing={writing === it.msg.id} />
+                <Bubble msg={it.msg} chat={chat} from={from} out={it.out} last={it.last} pics={pics.get(it.msg)} images={imgLines.get(it.msg)} writing={it.msg.provisional || writing === it.msg.id} />
               )}
             </Row>
           </Fragment>
@@ -1383,7 +1391,7 @@ function askHead(q: Question, chat: Chat) {
   // a task worker's, in its Assistant's chat: headed by its task, its own chat a link (no terminal link)
   if (q.by) return { who: q.by.ref, links: [{ label: 'Open chat', fn: () => goChat(q.by!.chat) }, ...last], dismiss }
   const terminal = () => void act({ type: 'answer', chat: chat.key, question: q.id, terminal: true } as never).then(() => openTerminal(chat.key), () => undefined)
-  return { who: chat.cli === 'codex' ? 'Codex' : 'Claude', links: [{ label: 'Answer in terminal', fn: terminal }, ...last], dismiss }
+  return { who: chat.cli === 'pi' ? 'Pi' : chat.cli === 'codex' ? 'Codex' : 'Claude', links: [{ label: 'Answer in terminal', fn: terminal }, ...last], dismiss }
 }
 
 /** a questions card's "Chat about this": no answer; the agent hears the person wants to talk it over, and the box
@@ -1800,6 +1808,10 @@ async function deliver(cid: string) {
   if (delivering.has(cid)) return
   const first = getState().outbox.find((x) => x.cid === cid)
   if (!first || first.state !== 'sending') return
+  if (first.piInFlight) {
+    setOutbox((all) => all.map((o) => o.cid === cid ? unconfirmedPi(o) : o))
+    return
+  }
   delivering.add(cid)
   // the agent gets them in the order they were sent: this one's message waits for the ones sent before it in this
   // chat (words sent while earlier pictures still go up never overtake them); their files go up meanwhile
@@ -1827,22 +1839,31 @@ async function deliver(cid: string) {
     if (standIns.length) patch(() => ({ files, up: undefined }))
     // a reload now would cut it off on its way
     const release = holdReload()
-    let r: { waiting?: boolean; waitsFor?: Outgoing['waitsFor']; at?: number }
+    let r: { ok?: boolean; waiting?: boolean; waitsFor?: Outgoing['waitsFor']; at?: number }
+    const pi = !!o.pi || getState().chats[o.chat]?.cli === 'pi'
+    const send = () => act({ type: 'send', chat: o.chat, text: o.text, attachments: files.map((f) => f.path), cid, reply: o.reply?.id,
+      human: true, hold: o.hold, pi: pi || undefined, piHistory: o.piHistory }, AbortSignal.timeout(SEND_TIMEOUT))
     try {
-      r = (await retrying(
-        () => act({ type: 'send', chat: o.chat, text: o.text, attachments: files.map((f) => f.path), cid, reply: o.reply?.id, human: true, ...(o.hold ? { hold: true } : {}) } as never, AbortSignal.timeout(SEND_TIMEOUT)),
-        since,
-        { onWait },
-      )) as typeof r
+      if (pi) {
+        patch(() => ({ pi: true, piInFlight: true }))
+        try {
+          r = await send()
+          if (r?.ok !== true) throw new TypeError('No Pi send receipt')
+        } catch (e) {
+          if (transient(e)) { patch(unconfirmedPi); return }
+          throw e
+        }
+      } else r = await retrying(send, since, { onWait })
     } finally {
       release()
     }
     // the chat may already show it waiting (queued) or gone in: that knows better than the answer
     const serverAt = typeof r?.at === 'number' ? r.at : undefined
-    patch((x) => ({ state: 'sent', error: undefined, offline: undefined, up: undefined, serverAt, ...(x.queued || x.wentAt ? {} : { waiting: r?.waiting || undefined, waitsFor: (r?.waiting && r.waitsFor) || undefined }) }))
+    patch((x) => ({ state: 'sent', error: undefined, offline: undefined, up: undefined, piInFlight: undefined, serverAt, ...(x.queued || x.wentAt ? {} : { waiting: r?.waiting || undefined, waitsFor: (r?.waiting && r.waitsFor) || undefined }) }))
     void dropFiles(standIns)
   } catch (e) {
-    patch(() => ({ state: 'failed', error: reasonOf(e), offline: undefined, up: undefined }))
+    const refusal = e instanceof HttpError ? e.sendRefusal : undefined
+    patch(() => ({ state: 'failed', error: reasonOf(e), noRetry: !!refusal, ambiguous: refusal === 'unconfirmed', piInFlight: undefined, offline: undefined, up: undefined }))
   } finally {
     delivering.delete(cid)
     gates.delete(cid)
@@ -1858,7 +1879,7 @@ const newCid = () => `${Date.now().toString(36)}-${Math.random().toString(36).sl
 function retry(cid: string) {
   const s = getState()
   const o = s.outbox.find((x) => x.cid === cid)
-  if (!o) return
+  if (!o || o.noRetry || !sameOutgoingHistory(o, s.chats[o.chat])) return
   const again: Outgoing = { ...o, cid: o.lost ? newCid() : o.cid, state: 'sending', error: undefined, lost: undefined, waiting: undefined, waitsFor: undefined, queued: undefined, serverAt: undefined, wentAt: undefined, busyAt: undefined, pastAt: undefined, offline: undefined, up: undefined, at: Date.now(), prior: priorOf(s.chats[o.chat]), after: anchorOf(s.chats[o.chat]), before: s.outbox.filter((x) => x.chat === o.chat && x.cid !== cid).map((x) => x.cid) }
   setOutbox((all) => all.map((x) => (x.cid === cid ? again : x)))
   void deliver(again.cid)
@@ -1997,12 +2018,15 @@ function Composer({ chatKey, placeholder, cli, suggest = null }: { chatKey: stri
   const [msel, setMsel] = useState(0)
   useEffect(() => setMsel(0), [word, (MNc as any).typingTask(text) === null])
   const takeMention = (i: Item) => { setText(takeItem(chatKey, text, i)); ref.current?.focus() }
+  const piBlocked = useStore((s) => cli === 'pi' && s.chats[chatKey]?.blocked !== undefined)
+  const piHistory = useStore((s) => s.chats[chatKey]?.piHistory)
   const send = (hold = false, words = text) => {
+    if ((!hold && piBlocked) || (cli === 'pi' && !piHistory)) return
     const t = expandPicked(chatKey, words.trim())
     if (!t && !files.length) return
     recall.current = -1
     const reply = getState().ui.reply[chatKey]
-    const model = reply ? undefined : modelCommand(t)
+    const model = reply || cli === 'pi' ? undefined : modelCommand(t)
     if (model !== undefined) {
       setText('')
       const place = getState().snap?.places.find((p) => p.chat === chatKey)
@@ -2029,13 +2053,14 @@ function Composer({ chatKey, placeholder, cli, suggest = null }: { chatKey: stri
       after: anchorOf(getState().chats[chatKey]),
       before: getState().outbox.filter((o) => o.chat === chatKey).map((o) => o.cid),
       ...(hold ? { hold: true } : {}),
+      ...(cli === 'pi' ? { pi: true, piHistory } : {}),
     }
     setOutbox((all) => [...all, out])
     void deliver(out.cid)
   }
   // Enter or Send with nothing typed sends the suggestion; Tab fills it in for editing (below)
   const accept = (hold = false) => {
-    if (!ghost) return
+    if (!ghost || (piBlocked && !hold)) return
     setSpent(ghost.id)
     send(hold, ghost.text)
   }
@@ -2044,7 +2069,7 @@ function Composer({ chatKey, placeholder, cli, suggest = null }: { chatKey: stri
     // shows over the box (working, queued, jobs, lists) is a stack with one gap, none of its own: as the window's
     <div data-kb data-keep-box className={clsx('mx-auto flex w-full max-w-read shrink-0 flex-col gap-2 px-4 pt-2', keyboard && device === 'phone' ? 'pb-1' : 'pb-2.5')}>
       <ComposerAbove chatKey={chatKey} cli={cli} />
-      <SlashList chatKey={chatKey} text={text} pick={(name) => { setText(`/${name} `); ref.current?.focus() }} />
+      {cli !== 'pi' && <SlashList chatKey={chatKey} text={text} pick={(name) => { setText(`/${name} `); ref.current?.focus() }} />}
       <MentionList items={mentions} sel={msel} from={reach?.from ?? null} pick={takeMention} />
       {/* the window's box: the words across its full width, then a row in it of attach on the left and on the right
           what the agent runs on (the model menu), the mic and Send; nothing under it. Its corners are half a
@@ -2164,13 +2189,13 @@ function Composer({ chatKey, placeholder, cli, suggest = null }: { chatKey: stri
                 </IconButton>
               ) : null}
               <div className="flex-1" />
-              <AgentLineKept chatKey={chatKey} cli={cli} />
+              {cli === 'pi' ? <span className="px-2 text-xs text-fg2">Pi</span> : <AgentLineKept chatKey={chatKey} cli={cli} />}
               {Mic ? <MicKept chatKey={chatKey} /> : null}
               {/* always Send (SHEP-108): quiet while there is nothing to send, filled once there is. A call is with
                   Shepherdr itself (the sidebar's top, a phone's bottom bar), never from a chat's box */}
               <button
                   type="button"
-                aria-label="Send"
+                aria-label={piBlocked ? 'Queue message' : 'Send'}
                 disabled={!sendable}
                 // Shepherdr 3 on a phone: a long press on Send holds it until the agent is free (the phone's Ctrl+Enter)
                 onPointerDown={() => { held.current = false; holdTimer.current = setTimeout(() => { held.current = true; buzz(); if (ghost && !text) accept(true); else send(true) }, 500) }}
@@ -2182,12 +2207,12 @@ function Composer({ chatKey, placeholder, cli, suggest = null }: { chatKey: stri
                   // a light tap from the phone as it goes, like ChatGPT's
                   if (matchMedia('(pointer: coarse)').matches) buzz()
                   // with nothing typed, Send sends the suggested next message
-                  if (ghost && !text) accept()
-                  else send()
+                  if (ghost && !text) accept(piBlocked)
+                  else send(piBlocked)
                 }}
-                className="press-dim relative grid size-[34px] shrink-0 place-items-center rounded-full bg-fg text-bg after:absolute after:-inset-1.5 disabled:bg-bubble disabled:text-fg3 phone:size-11"
+                className={clsx('press-dim relative grid h-[34px] shrink-0 place-items-center rounded-full bg-fg text-bg after:absolute after:-inset-1.5 disabled:bg-bubble disabled:text-fg3 phone:h-11', piBlocked ? 'px-3 text-xs font-medium' : 'w-[34px] phone:w-11')}
               >
-                <UpIcon className={ic} />
+                {piBlocked ? 'Queue' : <UpIcon className={ic} />}
               </button>
             </div>
           </>
@@ -2199,10 +2224,33 @@ function Composer({ chatKey, placeholder, cli, suggest = null }: { chatKey: stri
 
 const noFiles: { name: string; path?: string }[] = []
 
+function PreviousPiSends({ chatKey }: { chatKey: string }) {
+  const chat = useStore((s) => s.chats[chatKey])
+  const outbox = useStore((s) => s.outbox)
+  const previous = chat && !chat.notice ? outbox.filter((o) => o.chat === chatKey && o.pi && !sameOutgoingHistory(o, chat)) : []
+  if (!previous.length) return null
+  const restore = (o: Outgoing) => {
+    setDraft(chatKey, [getDraft(chatKey), o.text].filter(Boolean).join('\n\n'))
+    setUI((u) => {
+      const { [chatKey]: _, ...reply } = u.reply
+      return { reply, files: { ...u.files, [chatKey]: [...(u.files[chatKey] ?? []), ...o.files] }, focus: chatKey }
+    })
+    removeOut(o.cid)
+  }
+  return <details className="rounded-row bg-well px-3 py-2 text-[0.75rem] text-fg2">
+    <summary className="cursor-pointer">Messages from a previous Pi conversation</summary>
+    <p className="py-1 text-fg3">Check the terminal before sending these again.</p>
+    {previous.map((o) => <div key={o.cid} className="flex items-center justify-between gap-2 py-1">
+      <span className="truncate">{o.text || o.files.map((f) => f.name).join(', ')}</span>
+      <LinkButton onClick={() => restore(o)}>Edit as draft</LinkButton>
+    </div>)}
+  </details>
+}
+
 // What sits round the message box but not its words (what shows over it, the model menu, the mic) is drawn again only
 // when its own bits change, not on each letter typed (#631)
 const ComposerAbove = memo(function ComposerAbove({ chatKey, cli }: { chatKey: string; cli: string }) {
-  return registry.composerAbove.map(({ View }, i) => <View key={i} chatKey={chatKey} cli={cli} />)
+  return <><PreviousPiSends chatKey={chatKey} />{registry.composerAbove.map(({ View }, i) => <View key={i} chatKey={chatKey} cli={cli} />)}</>
 })
 const AgentLineKept = memo(AgentLine)
 const MicKept = memo(function MicKept({ chatKey }: { chatKey: string }) {
@@ -2697,7 +2745,31 @@ function scrollKept(chatKey: string): number | null {
   }
 }
 
-function StickToBottom({ chatKey, children }: { chatKey: string; children: ReactNode }) {
+type PiAnchor = { id: string; offset: number }
+type PiAnchorProps = { box: RefObject<HTMLDivElement | null>; before?: number; children: ReactNode }
+
+// Pi can prepend a page while this tab reads farther up. The head row also changes, so do not let the browser
+// anchor to that row. Measure an actual message before React updates the DOM, including pages another tab asked for.
+class KeepPiAnchor extends Component<PiAnchorProps> {
+  getSnapshotBeforeUpdate(previous: PiAnchorProps): PiAnchor | null {
+    const { box, before } = this.props
+    const el = box.current
+    if (before === undefined || previous.before === undefined || before >= previous.before || !el) return null
+    const top = el.getBoundingClientRect().top
+    const rows = el.querySelectorAll<HTMLElement>('[data-msg]')
+    const row = Array.from(rows).find((r) => r.getBoundingClientRect().bottom > top)
+    return row?.dataset.msg ? { id: row.dataset.msg, offset: row.getBoundingClientRect().top - top } : null
+  }
+  componentDidUpdate(_previous: PiAnchorProps, _state: unknown, anchor: PiAnchor | null) {
+    const el = this.props.box.current
+    if (!anchor || !el) return
+    const row = el.querySelector(`[data-msg="${CSS.escape(anchor.id)}"]`)
+    if (row) el.scrollTop += row.getBoundingClientRect().top - el.getBoundingClientRect().top - anchor.offset
+  }
+  render() { return this.props.children }
+}
+
+function StickToBottom({ chatKey, piBefore, children }: { chatKey: string; piBefore?: number; children: ReactNode }) {
   const box = useRef<HTMLDivElement>(null)
   const inner = useRef<HTMLDivElement>(null)
   const pinned = useRef(true)
@@ -2709,7 +2781,7 @@ function StickToBottom({ chatKey, children }: { chatKey: string; children: React
   const questionIds = useStore((s) => (s.chats[chatKey]?.messages ?? []).filter((m) => (m.question && m.question.sent === undefined && !m.question.closed) || (m.secret && !m.secret.saved)).map((m) => m.id).join('\n'))
   const questions = questionIds ? questionIds.split('\n').map((id) => ({ id })) : []
   // the agent's messages, and how many of them you had seen at the bottom
-  const replies = useStore((s) => (s.chats[chatKey]?.messages ?? []).filter((m) => m.who === 'agent' && !m.waiting).map((m) => m.id).join('\n'))
+  const replies = useStore((s) => (s.chats[chatKey]?.messages ?? []).filter((m) => m.who === 'agent' && !m.waiting && !m.provisional).map((m) => m.id).join('\n'))
   const ids = replies ? replies.split('\n') : []
   /** the replies you had in view at the bottom: the others came in while you read further up */
   const read = useRef<Set<string> | null>(null)
@@ -2854,7 +2926,7 @@ function StickToBottom({ chatKey, children }: { chatKey: string; children: React
         className="flex min-h-0 flex-1 touch-pan-y touch-pinch-zoom flex-col overflow-x-hidden overflow-y-auto overscroll-contain"
       >
         <div ref={inner} data-kb className="flex flex-1 flex-col">
-          <NewAt.Provider value={newAt}>{children}</NewAt.Provider>
+          <NewAt.Provider value={newAt}><KeepPiAnchor box={box} before={piBefore}>{children}</KeepPiAnchor></NewAt.Provider>
         </div>
       </div>
       {/* read further up, the chat fades out at the bottom, so the arrow sits on the fade, not on crisp words (like
@@ -2884,11 +2956,12 @@ function StickToBottom({ chatKey, children }: { chatKey: string; children: React
  *  id, or the agent of one of the space's tabs */
 function placeholderOf(chatKey: string, chat: Chat | undefined, fallback: string) {
   // a card asks, or the agent asks in its terminal: words written here answer it
+  if (chat?.cli === 'pi') return chat.blocked ?? 'Message Pi'
   if (chat?.blocked !== undefined || chat?.messages.some((m) => m.question && m.question.sent === undefined && !m.question.closed)) return WORDS.replyInstead
   if (chatKey.startsWith('p:')) return 'Message the Assistant'
   const task = taskChatId(chatKey)
   if (task) return `Message ${task}`
-  return chatKey.startsWith('t:') ? `Message ${({ claude: 'Claude Code', codex: 'Codex' } as Record<string, string>)[chat?.cli ?? ''] ?? 'the agent'}` : fallback
+  return chatKey.startsWith('t:') ? `Message ${({ claude: 'Claude Code', codex: 'Codex', pi: 'Pi' } as Record<string, string>)[chat?.cli ?? ''] ?? 'the agent'}` : fallback
 }
 
 /** a task whose agent has ended: the window's line and its Resume, in place of the message box */
@@ -2921,7 +2994,7 @@ function ChatView({ chatKey, placeholder, unreachable }: { chatKey: string; plac
   return (
     <DropFiles chatKey={chatKey}>
       <FindBar chatKey={chatKey} />
-      <StickToBottom key={chatKey} chatKey={chatKey}>
+      <StickToBottom key={chat?.piView ? `${chatKey}:${chat.piView}` : chatKey} chatKey={chatKey} piBefore={chat?.piBefore}>
         {unreachable ? (
           <div className="mx-auto w-full max-w-read px-5 pt-4">
             <div role="status" className="rounded-box bg-bubble px-3 py-2.5 text-[0.8125rem] text-pretty text-fg2 phone:text-[0.9375rem]">

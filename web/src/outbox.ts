@@ -3,6 +3,7 @@
 // at once even while the agent works; a busy CLI may keep it until its next step, so it can take a while to come back.
 import type { Chat, Message, ReplyQuote } from '@shared/types.ts'
 import { GIVE_UP } from './uploads.ts'
+import { PI_UNCONFIRMED } from '../../core/pi-chat.js'
 
 export interface Outgoing {
   /** the screen's own id for it: the message comes back with it */
@@ -35,6 +36,12 @@ export interface Outgoing {
   prior?: string[]
   /** why it didn't go through */
   error?: string
+  noRetry?: boolean
+  ambiguous?: boolean
+  /** Pi sends are not replayed after a lost response or a page reload. */
+  pi?: boolean
+  piHistory?: string
+  piInFlight?: boolean
   /** it went in but never showed in the chat: Retry sends it as a new message */
   lost?: boolean
   /** when the chat first showed a newer message of yours than it, by this screen's clock: the log moved past it */
@@ -53,6 +60,7 @@ export interface Outgoing {
 /** how long one try of Send waits for the server to answer: one with many pictures for another machine takes a while
  *  (asked again with the same id, it never goes twice) */
 export const SEND_TIMEOUT = 90_000
+export const unconfirmedPi = (o: Outgoing): Outgoing => ({ ...o, state: 'failed', error: PI_UNCONFIRMED, noRetry: true, ambiguous: true, offline: undefined, up: undefined })
 /** one still sending (on this screen or another, or a reload ago) fails after this: it keeps trying by itself until
  *  then (uploads.ts GIVE_UP) */
 const KEEP_SENDING = GIVE_UP + 60_000
@@ -74,6 +82,9 @@ const SLACK = 5000
 /** a file as the log has it: on another machine it landed in a folder of its own there (hc put), under its own name */
 const sameFile = (a: string | undefined, b: string) => a === b || (!!a && a.split('/').pop() === b.split('/').pop())
 
+export const sameOutgoingHistory = (o: Outgoing, chat?: Chat) => o.pi || o.piHistory
+  ? chat?.cli === 'pi' && o.piHistory === chat.piHistory : chat?.cli !== 'pi'
+
 /** what this chat now shows of the pending ones. One that came back from the agent's log goes: by its id, or (from a
  *  machine on an older Shepherdr, or after its restart) by the very same message of yours: its words and files, new
  *  since you sent it, and read after it went in. One the chat shows waiting for the agent stays, hidden behind it, so
@@ -83,7 +94,7 @@ export function settle(out: Outgoing[], chat: Chat, now = Date.now()): Outgoing[
   const taken = new Set<string>()
   let changed = false
   const next = out.flatMap((o) => {
-    if (o.chat !== chat.key) return [o]
+    if (o.chat !== chat.key || !sameOutgoingHistory(o, chat)) return [o]
     const shown = chat.messages.filter((m) => m.cid === o.cid)
     if (shown.some((m) => !m.waiting)) {
       changed = true
@@ -95,10 +106,10 @@ export function settle(out: Outgoing[], chat: Chat, now = Date.now()): Outgoing[
       return [{ ...o, state: 'sent' as const, waiting: true, queued: true, error: undefined, lost: undefined }]
     }
     // the server says it couldn't go in (not one sent again since: that is on its way once more)
-    const failed = o.state === 'sent' && chat.failed?.find((f) => f.cid === o.cid)
+    const failed = (o.state === 'sent' || o.piInFlight) && chat.failed?.find((f) => f.cid === o.cid)
     if (failed) {
       changed = true
-      return [{ ...o, state: 'failed' as const, error: failed.error, waiting: undefined, queued: undefined }]
+      return [{ ...o, state: 'failed' as const, error: failed.error, noRetry: failed.noRetry, ambiguous: failed.ambiguous, piInFlight: undefined, waiting: undefined, queued: undefined }]
     }
     // it waited and is gone from the queue: it went in, and shows again until the log has it
     if (o.queued) {
@@ -187,6 +198,7 @@ export function expire(out: Outgoing[], now: number, working: (chat: string) => 
     }
     const fail = (error: string, lost?: boolean) => {
       changed = true
+      if (o.piInFlight || (o.pi && o.state === 'sent')) return unconfirmedPi(o)
       return { ...o, state: 'failed' as const, error, lost }
     }
     if (o.state === 'sending' && now - o.at > KEEP_SENDING) return fail("Couldn't reach Shepherdr.")
@@ -213,7 +225,7 @@ export function prune(out: Outgoing[], now: number, exists?: (chat: string) => b
 
 /** how it shows: a bubble for the text, one for each file, like what comes back; nothing while the chat shows it */
 export function partsOf(o: Outgoing, chat?: Chat): Message[] {
-  if (chat?.messages.some((m) => m.cid === o.cid)) return []
+  if (!sameOutgoingHistory(o, chat) || chat?.messages.some((m) => m.cid === o.cid)) return []
   const waiting = (o.state === 'sent' && o.waiting) || undefined
   const base = { who: 'you' as const, cid: o.cid, at: o.at, waiting, waitsFor: waiting && o.waitsFor }
   // the quote goes on the words, or on the first file when there are none
@@ -256,7 +268,7 @@ export function placesOf(rows: { id: string; cid?: string }[], out: Pick<Outgoin
 
 /** a message's place in the list: what you sent keeps one from the moment you tap Send, so the swap redraws nothing */
 export function keyOf(m: Message) {
-  return m.cid ? (m.file ? `${m.cid}:${m.file.path}` : m.cid) : m.id
+  return m.cid ? (m.file ? `${m.cid}:${m.file.path}` : m.cid) : m.renderId ?? m.id
 }
 
 /** why it didn't go through, in a few words */

@@ -560,6 +560,10 @@ export interface Message {
   suggest?: string
   /** a live row: when it last changed; at keeps its place in the chat */
   updated?: number
+  /** Pi is still streaming this text. It has no persisted message actions yet. */
+  provisional?: boolean
+  /** Stable visual key shared with the draft a finalized Pi record replaces. */
+  renderId?: string
   /** plain text (yours) or markdown (the agent's) */
   text?: string
   /** "Answered “Rerun CI on main?”" */
@@ -710,6 +714,8 @@ export interface TurnActivity {
   failed?: number
   /** 3.0's tools row, closed: "Read 3 files, ran 2 commands" (core/chat-log.js summary) */
   summary?: string
+  /** A Pi tool result is ready to fetch when the row opens. */
+  resultReady?: boolean
 }
 
 /** Work an agent started in the background that still runs */
@@ -855,13 +861,19 @@ export interface Chat {
    *  a shell), or in a turn it started itself (news, background work waking it) no reply has shown yet; no dots then */
   background?: boolean
   /** what a screen sent (by its Message.cid) that waited for the agent and then couldn't go in, and why */
-  failed?: { cid: string; error: string }[]
+  failed?: { cid: string; error: string; noRetry?: boolean; ambiguous?: boolean }[]
   /** finished agent: writing resumes it */
   finished?: boolean
   /** 3.0's first row: the log is read from its start ("Start of conversation"), or earlier pages are left to load
    *  as the chat scrolls up ("Loading earlier…") */
   top?: boolean
   earlier?: boolean
+  /** Changes when Pi history is replaced, so old page and tool requests cannot affect this view. */
+  piView?: string
+  /** The Pi instance and branch a send or pending message belongs to. */
+  piHistory?: string
+  /** Pi's oldest loaded position, which can change without adding a visible row. */
+  piBefore?: number
   /** 3.0's working line over the box: what it does now (empty: "Working"); waits: only waiting (a clock, no spinner) */
   doing?: string
   waits?: boolean
@@ -871,7 +883,7 @@ export interface Chat {
   /** a note at the conversation's end (a lost session being started again) */
   note?: string
   /** 3.0's notice instead of the conversation: opening it, not a chat agent, its log not found, its agent ended */
-  notice?: 'opening' | 'unsupported' | 'none' | 'ended' | 'gone'
+  notice?: 'opening' | 'unsupported' | 'none' | 'ended' | 'gone' | 'pi-unavailable'
   /** the turn that runs now: how far it got and its step on now, drawn as one quiet line at the end of the chat */
   live?: TurnActivity
   /** what it started in the background that still runs: subagents, shells, headless agents */
@@ -1253,7 +1265,7 @@ export type Action =
   /** cid: the screen's own id for what it sent, which comes back on the message (Message.cid); reply: the id of the
       message it answers; human: said in the app itself, the only kind of message that can take back a merge yes. Scripts
       leave it off */
-  | { type: 'send'; chat: string; text: string; attachments?: string[]; cid?: string; reply?: string; human?: boolean }
+  | { type: 'send'; chat: string; text: string; attachments?: string[]; cid?: string; reply?: string; human?: boolean; hold?: boolean; pi?: boolean; piHistory?: string }
   | { type: 'react'; chat: string; message: string; emoji: string }
   /** a secret kept at a level (all, m:<machine>, p:<machine>:<space>), or removed (null); kept on the main machine, so
       it names no chat or place to be passed on by. card: the agent's ask it answers, told once it is kept */

@@ -7,6 +7,7 @@ import type { Hub } from "./hub.ts";
 import { sh } from "./model.ts";
 import { ChatReader } from "../core/chat-reader.js";
 import { reportMsg, subagentsOf } from "../core/chat-view.js";
+import { failedOf } from "./send-once.ts";
 
 /** A page following a chat: told the reader (and the terminal now) each time the conversation changes. */
 export type Watcher = (reader: ChatReader, terminal: any) => void;
@@ -14,12 +15,16 @@ export type Watcher = (reader: ChatReader, terminal: any) => void;
 type Followed = { reader: ChatReader; pages: Set<Watcher>; busy: boolean; idleSince: number | null; ready: boolean;
   /** a change came while it was being read: read once more after */
   again?: boolean;
+  /** Pi subscribers may only receive polls that started after they subscribed. */
+  awaiting?: Map<Watcher, object>;
   /** its terminal's watch-only stream, and a read it asked for soon */
   stream?: { close(): void } | null; soon?: ReturnType<typeof setTimeout> | null; last?: number;
   /** what its CLI said it does when last told (the working line's words while no call is open in its log) */
   said?: string;
   /** its subagents as last told (SHEP-54): one starting, changing state or ending is news for its chat */
-  kids?: string };
+  kids?: string;
+  /** a held Pi send can fail without any change to Pi's snapshot */
+  piFailures?: string };
 
 /** a screen that keeps drawing (a spinner) asks for a read at most this often */
 const NUDGE = 200;
@@ -35,7 +40,7 @@ function readerFor(io: any, addr: string) {
  *  machine's always, and this machine's too on some herdr-core versions (#748). hc get has it, asked at most every
  *  10 s per terminal. */
 const fg = new Map<string, { at: number; foreground: any }>();
-async function withForeground(addr: string, t: any) {
+export async function withForeground(addr: string, t: any) {
   if (!t || t.foreground?.pid || t.state !== "live") return t;
   let c = fg.get(addr);
   if (!c || Date.now() - c.at > 10_000) {
@@ -63,9 +68,14 @@ export class Chats {
   watch(addr: string, page: Watcher) {
     let f = this.followed.get(addr);
     if (!f) this.followed.set(addr, (f = { reader: readerFor(this.io, addr), pages: new Set(), busy: false, idleSince: null, ready: false }));
+    if (f.reader.kind === "pi") {
+      // Revalidate before sending anything to a returning page. With nobody watching, discard the old cursor.
+      if (!f.pages.size) f.reader.refreshPi();
+      (f.awaiting ??= new Map()).set(page, {});
+    }
     f.pages.add(page);
     f.idleSince = null;
-    if (f.ready) page(f.reader, this.hub.terminals.get(addr));
+    if (f.ready && !f.awaiting?.has(page)) page(f.reader, this.hub.terminals.get(addr));
     void this.tick(addr);
   }
 
@@ -73,6 +83,7 @@ export class Chats {
     const f = this.followed.get(addr);
     if (!f) return;
     f.pages.delete(page);
+    f.awaiting?.delete(page);
     if (!f.pages.size) f.idleSince = Date.now();
   }
 
@@ -85,9 +96,9 @@ export class Chats {
   /** The reader of a chat someone follows now, else null. */
   reader(addr: string) { return this.followed.get(addr)?.reader ?? null; }
 
-  async earlier(addr: string) {
+  async earlier(addr: string, view?: string) {
     const f = this.followed.get(addr);
-    if (f && (await f.reader.earlier())) this.publish(addr, f);
+    if (f && (await f.reader.earlier(view)) && this.followed.get(addr) === f) this.publish(addr, f);
   }
 
   /** Its terminal drew something: read its log soon (at once, else NUDGE after the last read). */
@@ -129,16 +140,28 @@ export class Chats {
     f.busy = true;
     f.again = false;
     f.last = Date.now();
+    const awaiting = [...(f.awaiting ?? [])];
     try {
       const t = await withForeground(addr, this.hub.terminals.get(addr));
       let changed = await f.reader.locate(t);
       if (await f.reader.pull()) changed = true;
       if (await f.reader.lookJobs()) changed = true;
+      if (f.reader.kind === "pi" || f.piFailures) {
+        const failures = JSON.stringify(failedOf(addr));
+        if (failures !== f.piFailures) { f.piFailures = failures; changed = true; }
+      }
       // its CLI says it does something else now (a status change, no new line in its log): told too
       const said = reportMsg(t);
       if (said !== f.said) { f.said = said; changed = true; }
       const kids = subagentsOf([...this.hub.terminals.values()], addr).map((k: any) => `${k.address}:${k.status}:${k.ended ?? ""}`).join(" ");
       if (kids !== (f.kids ?? "")) { f.kids = kids; changed = true; }
+      if (f.reader.kind !== "pi" || !f.reader.piFresh || f.reader.state === "unavailable") {
+        for (const [page, token] of awaiting) {
+          if (f.awaiting?.get(page) !== token) continue;
+          f.awaiting.delete(page);
+          changed = true;
+        }
+      }
       if (changed || !f.ready) this.publish(addr, f);
     } catch (err) {
       console.error(`chat ${addr}: ${(err as Error).message}`);
@@ -149,8 +172,9 @@ export class Chats {
   }
 
   private publish(addr: string, f: Followed) {
+    if (f.reader.kind === "pi" && f.reader.piFresh && f.reader.state !== "unavailable") return;
     f.ready = true;
     const t = this.hub.terminals.get(addr);
-    for (const page of f.pages) page(f.reader, t);
+    for (const page of f.pages) if (!f.awaiting?.has(page)) page(f.reader, t);
   }
 }

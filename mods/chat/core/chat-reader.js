@@ -4,12 +4,13 @@
 // script on the agent's machine (null: here).
 // Shared core: the source is core/chat-reader.js.
 
-import { FIND, LOG, Conversation, records, resultText } from "./chat-log.js";
+import { FIND, LOG, Conversation, records, resultText, piConversation } from "./chat-log.js";
+import { piSnapshot, piPage, piResults, samePiHistory } from "./pi-chat.js";
 import { BgJobs } from "./bg-jobs.js";
 
 export const PAGE = 200;
 export const KEEP = 2000;
-export const KINDS = { "claude-code": "claude", claude: "claude", codex: "codex" };
+export const KINDS = { "claude-code": "claude", claude: "claude", codex: "codex", pi: "pi" };
 
 // The CLI a terminal runs, as the chat knows them ("claude", "codex"), else null.
 export const kindOf = (t) => KINDS[t?.status?.app] ?? KINDS[t?.foreground?.name] ?? null;
@@ -27,6 +28,14 @@ export class ChatReader {
     this.path = null;
     this.kind = null;
     this.pid = null;
+    this.pi = null;
+    this.piVersion = null;
+    this.piItems = [];
+    this.piEnd = null;
+    this.piView = null;
+    this.piFresh = true;
+    this.piBarrier = {};
+    this.piReadSeq = 0;
     this.start = null;   // the first byte read (0: the log's very start)
     this.end = 0;
     this.records = [];
@@ -52,7 +61,14 @@ export class ChatReader {
     if (this.pinned) return false;
     const kind = kindOf(t);
     const pid = t?.foreground?.pid;
-    if (!kind || !pid) { const was = this.state; if (was !== "none") { this.reset(); this.state = "none"; } return was !== "none"; }
+    if (kind === "pi" && t?.state !== "ended") {
+      if (this.kind === "pi" && this.pid === pid) return false;
+      this.reset();
+      this.kind = kind;
+      this.pid = pid;
+      return true;
+    }
+    if (!kind || !pid || kind === "pi") { const was = this.state; if (was !== "none") { this.reset(); this.state = "none"; } return was !== "none"; }
     if (this.path && this.kind === kind && this.pid === pid) return false;
     const f = await this.io.sh(FIND, ["chat", kind, String(pid)], this.machine);
     const path = String(f.stdout ?? "").trim().split("\n").pop() ?? "";
@@ -103,8 +119,54 @@ export class ChatReader {
     this.conv.feed(this.records);
   }
 
+  refreshPi() {
+    this.piFresh = true;
+    this.piBarrier = {};
+  }
+
+  rebuildPi() {
+    const live = (this.pi.live ?? []).map((x) => ({ ...x, provisional: true }));
+    this.conv = piConversation([...this.piItems, ...live], this.pi);
+  }
+
+  async pullPi() {
+    const barrier = this.piBarrier, seq = ++this.piReadSeq;
+    const previous = this.piFresh ? null : this.pi;
+    const next = await piSnapshot(this.io.sh, this.addr, this.pid, previous);
+    if (this.piBarrier !== barrier || this.piReadSeq !== seq) return false;
+    if (!next) {
+      if (this.state === "unavailable") return false;
+      this.refreshPi();
+      this.pi = this.piView = this.piVersion = this.piEnd = this.start = this.conv = null;
+      this.piItems = [];
+      this.state = "unavailable";
+      return true;
+    }
+    const replace = !samePiHistory(previous, next) || next.reset !== false;
+    const version = JSON.stringify([next.instance, next.session, next.leaf, next.generation, next.state, next.live]);
+    if (next.generation) {
+      // A newer bridge signals append or replacement explicitly. Never splice a delta from a different history.
+      if (next.reset === false && (replace || next.before !== this.piEnd)) { this.refreshPi(); return false; }
+      if (!replace && !next.items.length && version === this.piVersion) return false;
+    } else if (JSON.stringify(next) === this.piVersion && !this.piFresh) return false;
+    if (replace) {
+      this.piBarrier = {};
+      this.piView = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      this.piItems = next.items;
+      this.start = next.before ?? null;
+    } else if (next.items.length) this.piItems.push(...next.items);
+    this.piEnd = next.generation ? next.before + next.items.length : null;
+    this.piFresh = false;
+    this.piVersion = next.generation ? version : JSON.stringify(next);
+    this.pi = next;
+    this.state = "ready";
+    this.rebuildPi();
+    return true;
+  }
+
   // The newest page first; after that, what the log gained since. -> true when there's something new.
   async pull() {
+    if (this.kind === "pi" && !this.pinned) return this.pullPi();
     if (!this.path) return false;
     const path = this.path;
     if (this.start === null) {
@@ -144,7 +206,19 @@ export class ChatReader {
   async results(steps) {
     const out = new Map();
     const want = (steps ?? []).filter((s) => s.out !== undefined);
-    if (!want.length || !this.path) return out;
+    if (!want.length) return out;
+    if (this.kind === "pi" && this.pi?.generation) {
+      if (this.piFresh) return out;
+      const { generation } = this.pi, barrier = this.piBarrier;
+      const ids = [...new Set(want.map((s) => s.out))].slice(0, 10);
+      const r = await piResults(this.io.sh, this.addr, this.pid, generation, ids);
+      if (barrier !== this.piBarrier) return out;
+      if (r?.error === "stale_revision") this.refreshPi();
+      if (!samePiHistory(this.pi, r) || !Array.isArray(r.outputs)) return out;
+      for (const x of r.outputs) for (const s of want) if (x.id === s.out) out.set(s.id, x.text);
+      return out;
+    }
+    if (!this.path) return out;
     const offs = [...new Set(want.map((s) => s.out))].slice(0, 40);
     const r = await this.log(["results", this.path, ...offs.map(String)]);
     for (const part of String(r.stdout ?? "").split("\x1e").slice(1)) {
@@ -157,7 +231,20 @@ export class ChatReader {
   }
 
   // The page before what is read. -> true when there was one.
-  async earlier() {
+  /** @param {string} [view] */
+  async earlier(view) {
+    if (this.kind === "pi" && !this.pinned) {
+      if (this.piFresh || !this.start || !this.pi?.generation || (view !== undefined && view !== this.piView)) return false;
+      const { generation } = this.pi, before = this.start, barrier = this.piBarrier;
+      const r = await piPage(this.io.sh, this.addr, this.pid, generation, before);
+      if (barrier !== this.piBarrier || this.start !== before) return false;
+      if (r?.error === "stale_revision") this.refreshPi();
+      if (!samePiHistory(this.pi, r) || !Array.isArray(r.items) || !(r.before >= 0 && r.before < before)) return false;
+      this.start = r.before;
+      this.piItems = [...r.items, ...this.piItems];
+      this.rebuildPi();
+      return true;
+    }
     if (!this.start || !this.path) return false;
     const path = this.path, before = this.start;
     const r = await this.log(["page", path, String(before), String(PAGE)]);

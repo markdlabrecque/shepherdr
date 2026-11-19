@@ -2,7 +2,29 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LOG, Conversation, records, pilotLine, sendsOf } from "./chat-log.js";
+import { LOG, Conversation, records, pilotLine, sendsOf, piConversation } from "./chat-log.js";
+
+test("Pi notices are quiet and concurrent results pair by call entry and block, not by order", () => {
+  const row = (id, role, text) => ({ id, role, text, at: 42 });
+  const items = [row("1:0", "user", "original prompt"), row("2:0", "tool", "read"), row("2:1", "tool", "custom_tool"),
+    row("3:0", "result", "2:1"), row("4:0", "compaction", "retained summary"),
+    row("5:0", "custom", "visible extension"), row("6:0", "thinking", "private thoughts")];
+  const c = piConversation(items, { session: "s", generation: "g", state: "working" });
+  expect(c.doing).toBe("Using read");
+  expect(c.items.map((x) => x.kind)).toEqual(["user", "tools", "tools", "brief", "brief"]);
+  expect(c.items[1].steps[0].out).toBeUndefined();
+  expect(c.items[2].steps[0]).toMatchObject({ id: "pi:s:g:2:1", kind: "tool", out: "2:1" });
+  expect(c.items[3]).toMatchObject({ label: "Compaction summary", text: "retained summary" });
+  expect(piConversation(items, { session: "s", generation: "g", state: "idle" }).doing).toBeNull();
+});
+
+test("Pi reconstructs adjacent pieces of a long message in the same text block", () => {
+  const a = { id: "long:0", role: "assistant", at: 42 };
+  const tail = { ...a, part: 1, text: "line two" };
+  const c = piConversation([{ ...a, part: 0, text: "line one\n" }, tail]);
+  expect(c.items).toEqual([{ id: a.id, kind: "agent", at: a.at, text: "line one\nline two" }]);
+  expect(tail.text).toBe("line two");
+});
 
 // A Claude Code log as LOG reads it, fed to a Conversation.
 async function read(lines) {

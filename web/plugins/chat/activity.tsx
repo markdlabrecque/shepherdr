@@ -63,23 +63,28 @@ type Got = { data?: ActivityAnswer; loading: boolean }
 const got = new Map<string, Got>()
 const listeners = new Set<() => void>()
 
-async function ask(chat: string, what: 'turn' | 'output' | 'job', id: string) {
-  const k = `${chat}|${what}|${id}`
-  got.set(k, { ...(got.get(k) ?? {}), loading: true })
+const activityKey = (chat: string, what: string, id: string, view?: string) => JSON.stringify([chat, what, id, view])
+
+async function ask(chat: string, what: 'turn' | 'output' | 'job', id: string, view?: string) {
+  const k = activityKey(chat, what, id, view)
+  const pending = { ...(got.get(k) ?? {}), loading: true }
+  got.set(k, pending)
   listeners.forEach((l) => l())
   try {
-    const r = await fetch(`api/activity?${new URLSearchParams({ chat, what, id })}`)
+    const r = await fetch(`api/activity?${new URLSearchParams({ chat, what, id, ...(view ? { view } : {}) })}`)
     const b = (await r.json().catch(() => ({}))) as ActivityAnswer
+    if (got.get(k) !== pending) return
     got.set(k, { data: r.ok ? b : { error: ('error' in b && b.error) || `It said ${r.status}.` }, loading: false })
   } catch {
-    got.set(k, { ...(got.get(k) ?? {}), data: { error: "Can't reach Shepherdr right now." }, loading: false })
+    if (got.get(k) !== pending) return
+    got.set(k, { data: { error: "Can't reach Shepherdr right now." }, loading: false })
   }
   listeners.forEach((l) => l())
 }
 
 /** what the server says of a turn, a step's output or a job: asked when shown, and again every `every` ms */
-function useActivity(chat: string, what: 'turn' | 'output' | 'job', id: string, every = 0): Got {
-  const k = `${chat}|${what}|${id}`
+function useActivity(chat: string, what: 'turn' | 'output' | 'job', id: string, every = 0, view?: string, enabled = true): Got {
+  const k = activityKey(chat, what, id, view)
   const v = useSyncExternalStore(
     (l) => {
       listeners.add(l)
@@ -88,12 +93,13 @@ function useActivity(chat: string, what: 'turn' | 'output' | 'job', id: string, 
     () => got.get(k),
   )
   useEffect(() => {
-    void ask(chat, what, id)
+    if (!enabled) return
+    void ask(chat, what, id, view)
     if (!every) return
-    const t = setInterval(() => void ask(chat, what, id), every)
+    const t = setInterval(() => void ask(chat, what, id, view), every)
     return () => clearInterval(t)
-  }, [k, every])
-  return v ?? { loading: true }
+  }, [k, every, enabled])
+  return enabled && v ? v : { loading: enabled }
 }
 
 /* ---------- what opens: a turn's steps, a step's output, the background work, one job ---------- */
@@ -319,7 +325,7 @@ const Chevron = ({ on }: { on?: boolean }) => <ChevronDownIcon aria-hidden class
 
 /** 3.0's tools row: calls in a row, between the agent's words, as one quiet line ("› Read 3 files, ran 2 commands",
  *  core/chat-log.js summary); it opens to each call's line and the first lines it printed, read only then */
-export function TurnLine({ a, chat }: { a: TurnActivity; chat: string }) {
+export function TurnLine({ a, chat, view }: { a: TurnActivity; chat: string; view?: string }) {
   const [open, setOpen] = useState(false)
   const Chev = open ? ChevronDownIcon : ChevronRightIcon
   return (
@@ -329,14 +335,14 @@ export function TurnLine({ a, chat }: { a: TurnActivity; chat: string }) {
         <Chev aria-hidden className="size-3 shrink-0 fill-current" />
         <span className="min-w-0 flex-1 truncate">{a.summary ?? `${a.steps} steps`}</span>
       </button>
-      {open ? <ToolSteps a={a} chat={chat} /> : null}
+      {open ? <ToolSteps a={a} chat={chat} view={view} /> : null}
     </div>
   )
 }
 
 /** an open tools row: each call's line, and under it what it printed (asked of the server as the row opens) */
-function ToolSteps({ a, chat }: { a: TurnActivity; chat: string }) {
-  const g = useActivity(chat, 'turn', a.id)
+function ToolSteps({ a, chat, view }: { a: TurnActivity; chat: string; view?: string }) {
+  const g = useActivity(chat, 'turn', a.id, 0, view, a.resultReady !== false)
   const d = g.data
   const steps: { id: string; line: string; out?: string }[] = d && 'steps' in d ? d.steps.map((s) => ({ id: s.id, line: s.title, out: s.out })) : a.rows.map((r) => ({ id: r.key, line: r.text }))
   return (

@@ -142,6 +142,7 @@ export async function settleBox(io, addr, body, opts = SETTLE) {
 // box is watched until it is clear (settleBox). again: its last send stayed in the box; if the box
 // holds exactly it still, it gets Enter, never typed twice. -> hc's result; stuck: still in the box.
 export async function sendTyped(io, addr, kind, body, opts = SETTLE, again = false) {
+  if (kind === "pi") return io.pi ? io.pi(body) : { code: 1, stderr: "Pi chat integration unavailable." };
   if (kind !== "claude") return io.hc(["send", addr, body]);
   if (again) {
     const box = await boxOf(io, addr);

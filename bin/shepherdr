@@ -133,7 +133,8 @@ def move_data(r, a, home):
         r.notes.append(n)
 # Helpers on the PATH: their name, and where the link leads (under the app home).
 LINKS = {"herdr-task": "mods/tasks/bin/herdr-task", "herdr-artifact": "mods/artifacts/bin/herdr-artifact",
-         "herdr-secret": "bin/herdr-secret", "herdr-browser": "bin/herdr-browser", "shepherdr": "bin/shepherdr"}
+         "herdr-secret": "bin/herdr-secret", "herdr-browser": "bin/herdr-browser", "shepherdr": "bin/shepherdr",
+         "herdr-pi-chat": "bin/herdr-pi-chat"}
 # Written by Herdr into each mod (editor types): never ours, never touched.
 GENERATED = {"gpui-kit.d.ts", "jsconfig.json"}
 SKIP = {"__pycache__", ".DS_Store"}
@@ -385,6 +386,8 @@ def service_items(src):
         for f in walk_files(os.path.join(src, top)):
             if top != "templates" or f.endswith(".md"):
                 items.append(("service", f"{SHARE}/{top}/{f}", os.path.join(src, top, f)))
+    pi = "integrations/pi/shepherdr.ts"
+    items.append(("service", f"{SHARE}/{pi}", os.path.join(src, pi)))
     # the artifact guide too (`herdr-artifact guide`), for agents on a web-only machine
     # and restart.sh, which the service runs to restart an Assistant from the web (service/layout-scripts.ts)
     for f in ("mods/artifacts/recipe-view.js", "mods/artifacts/markup.js", "mods/artifacts/ARTIFACTS.md", "install.sh",
@@ -428,7 +431,7 @@ def unit_text(root, bun, port=None):
     # hc, herdr-task and the helpers live in ~/.local/bin, which a user service's PATH lacks; and the tools herdr-task
     # and the agents run (gh, git, node, agent-browser, the CLIs…) where this install finds them (mise, nvm, brew…)
     # hc (herdr-core) too, wherever it is: a Nix or other package manager's install isn't in ~/.local/bin (GitHub #1048)
-    tools = ["hc", "herdr-app", "gh", "git", "node", "agent-browser", "claude", "codex", "python3", "tailscale", "pw-record",
+    tools = ["hc", "herdr-app", "gh", "git", "node", "agent-browser", "claude", "codex", "pi", "python3", "tailscale", "pw-record",
              "pw-play", "jq"]
     found = [tool_dir(t, p) for t in tools for p in [shutil.which(t)] if p]
     dirs = [os.path.join(root, BIN), os.path.dirname(bun), *found, "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
@@ -939,6 +942,52 @@ def link_helpers(r, rec):
     return links
 
 
+def pi_extension_path(r, directory):
+    directory = os.path.realpath(directory)
+    # Scratch installs must never follow .pi (or any directory below it) out of the root.
+    if r.root != os.path.realpath(real_home()) and os.path.commonpath((r.root, directory)) != r.root:
+        raise ValueError("Pi extensions directory is outside the install root")
+    return os.path.join(directory, "shepherdr.ts")
+
+
+def unlink_pi_extension(r, rec):
+    path = rec.get("piExtension")
+    dest = r.p(f"{SHARE}/integrations/pi/shepherdr.ts")
+    if not isinstance(path, str) or not os.path.isabs(path) or r.dry:
+        return
+    try:
+        if path != pi_extension_path(r, os.path.dirname(path)):
+            return  # recorded directory was moved or replaced by a symlink
+    except ValueError:
+        return
+    if os.path.islink(path) and os.readlink(path) == dest:
+        os.unlink(path)
+
+
+def link_pi_extension(r, rec, home):
+    configured = os.environ.get("PI_CODING_AGENT_DIR") if home else None
+    agent = os.path.abspath(os.path.expanduser(configured)) if configured else r.p(".pi/agent")
+    try:
+        path = pi_extension_path(r, os.path.join(agent, "extensions"))
+    except ValueError as e:
+        r.notes.append(str(e))
+        return
+    dest = r.p(f"{SHARE}/integrations/pi/shepherdr.ts")
+    if r.dry:
+        say(f"  link {path} -> {dest} (if unoccupied)")
+        return
+    if path == rec.get("piExtension") and os.path.islink(path) and os.readlink(path) == dest:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.symlink(dest, path)  # never replace a personal extension, including a dangling symlink
+    except OSError as e:
+        r.notes.append(f"Pi chat extension not linked at {path}: {e.strerror}")
+        return
+    unlink_pi_extension(r, rec)
+    rec["piExtension"] = path
+
+
 def install_guard(r, src, rec):
     rel = f"{BIN}/herdr-app"
     path, data = r.p(rel), read(os.path.join(src, "guard", "herdr-app"))
@@ -1229,6 +1278,7 @@ def cmd_install(a, update=False):
     rec["mods"] = {m: True for m in mods}
     rec["keys"], keys_changed = merge_keys(r, src, rec, a.keys, a.yes)
     rec["links"] = link_helpers(r, rec)
+    link_pi_extension(r, rec, home)
     move_data(r, a, home)   # before the service starts again: it then finds the data where it now is
     set_port(a, rec)
     set_https_port(a, root)
@@ -1344,6 +1394,7 @@ def cmd_install_web(a, update=False):
         os.makedirs(os.path.dirname(r.p(rel)), exist_ok=True)
         os.symlink(dest, r.p(rel))
     rec.update({"files": files, "links": links, "version": VERSION, "source": src, "at": r.stamp, "root": root, "web": True})
+    link_pi_extension(r, rec, home)
     # what this run replaced (an older herdr-task, the helpers…): uninstall puts it back
     if r.backed:
         rec["backups"] = [*rec.get("backups", []), r.backup_dir]
@@ -1365,6 +1416,7 @@ def cmd_install_web(a, update=False):
 def cmd_uninstall_web(a, root):
     r = Run(root, a.dry_run)
     rec = json.load(open(r.p(WEB_RECORD)))
+    unlink_pi_extension(r, rec)
     if root == os.path.realpath(real_home()) and not a.dry_run:
         if sys.platform == "darwin":
             subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT}"], capture_output=True)
@@ -1660,6 +1712,7 @@ def cmd_uninstall(a):
     r = Run(root, a.dry_run)
     kept = []
     files = rec.get("files", {})
+    unlink_pi_extension(r, rec)
     # The service stops first (only the real home's runs).
     if root == os.path.realpath(real_home()) and not a.dry_run and (UNIT in files or PLIST in files):
         if sys.platform == "darwin":

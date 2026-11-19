@@ -23,7 +23,7 @@ const { WORDS, clock, initialOf, bandActs, bandOrder, imagesLine, fitThumbs, THU
   questionsBelow: (n: number) => string
   clock: (at?: number) => string
   initialOf: (name: string) => string
-  bandActs: (side: 'user' | 'agent', text?: string, o?: { from?: string | null; fork?: boolean }) => string[]
+  bandActs: (side: 'user' | 'agent', text?: string, o?: { from?: string | null; fork?: boolean; rewind?: boolean }) => string[]
   bandOrder: (side: 'user' | 'agent', acts: string[], o?: { time?: boolean; react?: boolean }) => string[]
   imagesLine: (n: number) => string
   fitThumbs: (sizes: ({ w: number; h: number } | null)[], width?: number) => { boxes: { w: number; h: number }[]; h: number }
@@ -49,7 +49,7 @@ export const onTerminal = (fn: (chat: string) => void) => void (showTerminal = f
 export function Band({ msg, chat, cli }: { msg: Message; chat: string; cli?: boolean }) {
   const you = msg.who === 'you'
   const { copied, copy } = useCopy()
-  const acts = bandActs(you ? 'user' : 'agent', msg.text, { fork: cli !== false })
+  const acts = bandActs(you ? 'user' : 'agent', msg.text, { fork: cli !== false, rewind: cli !== false })
   const react = has('reactions')
   const pills = msg.reactions?.length ? registry.messageEdge.map(({ View }, i) => <View key={i} msg={msg} chat={{ key: chat } as Chat} />) : null
   const time = clock(msg.at)
@@ -250,15 +250,15 @@ export function Notice({ chat, resume }: { chat: Chat; resume?: () => Promise<un
   const [busy, setBusy] = useState(false)
   const n = chat.notice!
   const task = /\/worker$/.test(chat.key)
-  const title = n === 'opening' ? WORDS.opening : n === 'unsupported' ? WORDS.unsupported : n === 'none' ? WORDS.notFound : task ? WORDS.taskEnded : WORDS.agentEnded
-  const body = n === 'unsupported' ? WORDS.unsupportedBody : n === 'none' ? WORDS.notFoundBody : null
+  const title = n === 'pi-unavailable' ? 'Pi chat integration unavailable' : n === 'opening' ? WORDS.opening : n === 'unsupported' ? WORDS.unsupported : n === 'none' ? WORDS.notFound : task ? WORDS.taskEnded : WORDS.agentEnded
+  const body = n === 'pi-unavailable' ? 'Install the Shepherdr integration, then run /reload in Pi.' : n === 'unsupported' ? WORDS.unsupportedBody : n === 'none' ? WORDS.notFoundBody : null
   const btn = 'press-dim flex h-7 items-center gap-1.5 rounded-[7px] px-2.5 text-[0.78125rem] font-medium phone:h-10'
   return (
     <div role="status" data-notice={n} className="flex flex-1 flex-col items-center justify-center gap-1.5 px-6 text-center">
       <TermIcon className="size-[18px] text-fg3" />
       <div className="pt-1 font-medium text-fg">{title}</div>
       {body ? <div className="max-w-[360px] text-[0.78125rem] text-fg2">{body}</div> : null}
-      {n === 'unsupported' || n === 'none' ? (
+      {n === 'unsupported' || n === 'none' || n === 'pi-unavailable' ? (
         <div className="pt-2"><button type="button" onClick={() => showTerminal(chat.key)} className={clsx(btn, 'bg-fg text-bg')}><TermIcon className="size-3.5" />{WORDS.openTerminal}</button></div>
       ) : n === 'ended' && task && resume ? (
         <div className="pt-2"><button type="button" disabled={busy} onClick={() => { setBusy(true); void resume().finally(() => setBusy(false)) }} className={clsx(btn, 'bg-fg text-bg disabled:opacity-60')}>{busy ? WORDS.resuming : 'Resume'}</button></div>
@@ -318,22 +318,29 @@ if (typeof addEventListener === 'function') {
 export function HeadRow({ chat }: { chat: Chat }) {
   const ref = useRef<HTMLDivElement>(null)
   // scrolled up to it: the page before loads (as the window's loadEarlier), once per page
-  const asked = useRef(0)
-  const count = chat.messages.length
+  const asked = useRef<string | null>(null)
+  const cursor = `${chat.piView ?? ''}:${chat.piBefore ?? chat.messages.length}`
+  const load = () => {
+    if (asked.current === cursor) return
+    asked.current = cursor
+    void act({ type: 'earlier', chat: chat.key, view: chat.piView } as never).catch(() => undefined).finally(() => {
+      if (asked.current === cursor) asked.current = null
+    })
+  }
   useEffect(() => {
     const el = ref.current
     if (!el || !chat.earlier) return
     const io = new IntersectionObserver(([e]) => {
       // only while the person scrolls up (the window's wheel): a page loaded in its place doesn't load the next
-      if (!e?.isIntersecting || asked.current === count || Date.now() - scrolledUp > 1500) return
-      asked.current = count
-      void act({ type: 'earlier', chat: chat.key } as never).catch(() => undefined)
+      if (e?.isIntersecting && Date.now() - scrolledUp <= 1500) load()
     })
     io.observe(el)
     return () => io.disconnect()
-  }, [chat.earlier, chat.key, count])
+  }, [chat.earlier, chat.key, cursor])
   if (!chat.top && !chat.earlier) return null
-  return <div ref={ref} data-head={chat.top ? 'top' : 'earlier'} className="w-full py-[7px] text-center text-[0.75rem] text-fg3 phone:text-[0.8125rem]">{chat.top ? WORDS.top : WORDS.loading}</div>
+  return <div ref={ref} data-head={chat.top ? 'top' : 'earlier'} className="w-full py-[7px] text-center text-[0.75rem] text-fg3 phone:text-[0.8125rem]">
+    {chat.top ? WORDS.top : chat.piView ? <button type="button" onClick={load} className="hover:text-fg">Load earlier messages</button> : WORDS.loading}
+  </div>
 }
 
 /* ---------- images under a message ---------- */
