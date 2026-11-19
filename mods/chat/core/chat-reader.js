@@ -4,12 +4,13 @@
 // script on the agent's machine (null: here).
 // Shared core: the source is core/chat-reader.js.
 
-import { FIND, LOG, Conversation, records, resultText } from "./chat-log.js";
+import { FIND, LOG, Conversation, records, resultText, piConversation } from "./chat-log.js";
+import { piSnapshot } from "./pi-chat.js";
 import { BgJobs } from "./bg-jobs.js";
 
 export const PAGE = 200;
 export const KEEP = 2000;
-export const KINDS = { "claude-code": "claude", claude: "claude", codex: "codex" };
+export const KINDS = { "claude-code": "claude", claude: "claude", codex: "codex", pi: "pi" };
 
 // The CLI a terminal runs, as the chat knows them ("claude", "codex"), else null.
 export const kindOf = (t) => KINDS[t?.status?.app] ?? KINDS[t?.foreground?.name] ?? null;
@@ -27,6 +28,8 @@ export class ChatReader {
     this.path = null;
     this.kind = null;
     this.pid = null;
+    this.pi = null;
+    this.piVersion = null;
     this.start = null;   // the first byte read (0: the log's very start)
     this.end = 0;
     this.records = [];
@@ -52,7 +55,14 @@ export class ChatReader {
     if (this.pinned) return false;
     const kind = kindOf(t);
     const pid = t?.foreground?.pid;
-    if (!kind || !pid) { const was = this.state; if (was !== "none") { this.reset(); this.state = "none"; } return was !== "none"; }
+    if (kind === "pi" && t?.state !== "ended") {
+      if (this.kind === "pi" && this.pid === pid) return false;
+      this.reset();
+      this.kind = kind;
+      this.pid = pid;
+      return true;
+    }
+    if (!kind || !pid || kind === "pi") { const was = this.state; if (was !== "none") { this.reset(); this.state = "none"; } return was !== "none"; }
     if (this.path && this.kind === kind && this.pid === pid) return false;
     const f = await this.io.sh(FIND, ["chat", kind, String(pid)], this.machine);
     const path = String(f.stdout ?? "").trim().split("\n").pop() ?? "";
@@ -105,6 +115,18 @@ export class ChatReader {
 
   // The newest page first; after that, what the log gained since. -> true when there's something new.
   async pull() {
+    if (this.kind === "pi" && !this.pinned) {
+      const pid = this.pid;
+      const next = await piSnapshot(this.io.sh, this.addr, pid);
+      if (this.kind !== "pi" || this.pid !== pid) return false;
+      const version = next ? JSON.stringify(next) : "unavailable";
+      if (this.piVersion === version) return false;
+      this.piVersion = version;
+      this.pi = next;
+      this.state = next ? "ready" : "unavailable";
+      if (next) this.conv = piConversation(next.items);
+      return true;
+    }
     if (!this.path) return false;
     const path = this.path;
     if (this.start === null) {

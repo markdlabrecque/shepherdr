@@ -26,7 +26,7 @@ import { checkEvery, runPilot } from "./autopilot.ts";
 import { windowSection, setWindow, offList, offPlugins } from "./window.ts";
 import { record, deleteAll, note as noteUsage, followSwitch, isOn as insightsOn, logLines } from "./usage.ts";
 import { insightsSummary } from "./voice-data.ts";
-import { Chats } from "./chats.ts";
+import { Chats, withForeground } from "./chats.ts";
 import { act, findMachines, hc as hcRun } from "./actions.ts";
 import { AgentWatch } from "./watch.ts";
 import { Compat, activity, newsKey, placeKey } from "./compat.ts";
@@ -680,7 +680,10 @@ async function doAction(body: any): Promise<Response> {
     // a switch flipped: shown at once, on another machine's space too (its file read again there)
     if (body?.type === "mode" && typeof body.place === "string") await model.readPilot(body.place);
     return json(r);
-  } catch (err) { return new Response((err as Error).message, { status: 400 }); }
+  } catch (err) {
+    const e = err as Error & { noRetry?: boolean; ambiguous?: boolean };
+    return new Response(e.message, { status: 400, ...(e.noRetry ? { headers: { "x-shepherdr-send": e.ambiguous ? "unconfirmed" : "refused" } } : {}) });
+  }
 }
 
 /** The tailnet device a request came from (tailscale serve's forwarded address, as its node's id), or null: this
@@ -820,7 +823,8 @@ const server = Bun.serve<{ who: string }>({
       // the "/" list above the box (core/slash.js): its CLI's commands, and for Claude Code the person's own
       const a = compat.addrOf(url.searchParams.get("chat") ?? ""), t: any = a ? hub.terminals.get(a) : null;
       if (!a || !t) return json({ commands: [] });
-      const kind = kindOf(t) ?? "claude", machine = a.includes("/") ? a.split("/")[0] : null;
+      const kind = kindOf(t) ?? kindOf(await withForeground(a, t)) ?? "claude", machine = a.includes("/") ? a.split("/")[0] : null;
+      if (kind === "pi") return json({ commands: [] });
       const mine = kind === "claude" ? scanned((await sh(hub, SCAN, ["scan", t.foreground?.cwd ?? t.cwd ?? ""], machine).catch(() => ({ stdout: "" }))).stdout) : [];
       return json({ commands: commandList(kind, mine), menus: [...(MENU[kind] ?? [])] });
     }

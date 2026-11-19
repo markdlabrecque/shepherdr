@@ -63,6 +63,61 @@ class Install(unittest.TestCase):
     def p(self, *rel):
         return os.path.join(self.root, *rel)
 
+    def test_pi_extension_is_owned_only_if_installer_created_it(self):
+        root = ("--root", self.root)
+        install = (*root, "--yes")
+        directory = self.p(".pi/agent/extensions")
+        extension = os.path.join(directory, "shepherdr.ts")
+        dest = os.path.realpath(self.p(".local/share/shepherdr/integrations/pi/shepherdr.ts"))
+        os.makedirs(directory)
+        for personal in ("regular", "matching dangling link"):
+            with self.subTest(personal=personal):
+                if personal == "regular":
+                    with open(extension, "w") as file:
+                        file.write("// my extension\n")
+                else:
+                    os.symlink(dest, extension)
+                run("install", *install)
+                run("uninstall", *root)
+                if personal == "regular":
+                    with open(extension) as file:
+                        self.assertEqual(file.read(), "// my extension\n")
+                else:
+                    self.assertEqual(os.readlink(extension), dest)
+                os.unlink(extension)
+        run("install", *install)
+        self.assertEqual(os.readlink(extension), dest)
+        self.assertTrue(os.path.isfile(extension))
+        self.assertTrue(os.access(self.p(".local/bin/herdr-pi-chat"), os.X_OK))
+        run("update", *install)
+        run("uninstall", *root)
+        self.assertFalse(os.path.lexists(extension))
+        self.assertFalse(os.path.lexists(self.p(".local/bin/herdr-pi-chat")))
+
+    def test_pi_extension_stays_in_canonical_scratch_root(self):
+        with tempfile.TemporaryDirectory() as elsewhere:
+            alias = os.path.join(elsewhere, "root-link")
+            outside = os.path.join(elsewhere, "outside")
+            os.mkdir(outside)
+            os.symlink(self.root, alias)
+            os.symlink(outside, self.p(".pi"))
+            args = ("--root", alias, "--yes")
+            run("install", *args)
+            self.assertEqual(os.listdir(outside), [])
+            os.unlink(self.p(".pi"))
+            run("install", *args)
+            extensions = self.p(".pi/agent/extensions")
+            path = os.path.join(extensions, "shepherdr.ts")
+            dest = os.readlink(path)
+            self.assertIn(os.path.realpath(self.root), dest)
+            # A directory redirected after installation is not the one we own.
+            shutil.rmtree(extensions)
+            os.symlink(outside, extensions)
+            foreign = os.path.join(outside, "shepherdr.ts")
+            os.symlink(dest, foreign)
+            run("uninstall", "--root", alias)
+            self.assertEqual(os.readlink(foreign), dest)
+
     def test_install_again_update_uninstall(self):
         os.makedirs(self.p(".codex"))
         out = run("install", "--root", self.root, "--yes").stdout

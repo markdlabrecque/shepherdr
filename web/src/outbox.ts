@@ -3,6 +3,7 @@
 // at once even while the agent works; a busy CLI may keep it until its next step, so it can take a while to come back.
 import type { Chat, Message, ReplyQuote } from '@shared/types.ts'
 import { GIVE_UP } from './uploads.ts'
+import { PI_UNCONFIRMED } from '../../core/pi-chat.js'
 
 export interface Outgoing {
   /** the screen's own id for it: the message comes back with it */
@@ -35,6 +36,11 @@ export interface Outgoing {
   prior?: string[]
   /** why it didn't go through */
   error?: string
+  noRetry?: boolean
+  ambiguous?: boolean
+  /** Pi sends are not replayed after a lost response or a page reload. */
+  pi?: boolean
+  piInFlight?: boolean
   /** it went in but never showed in the chat: Retry sends it as a new message */
   lost?: boolean
   /** when the chat first showed a newer message of yours than it, by this screen's clock: the log moved past it */
@@ -53,6 +59,7 @@ export interface Outgoing {
 /** how long one try of Send waits for the server to answer: one with many pictures for another machine takes a while
  *  (asked again with the same id, it never goes twice) */
 export const SEND_TIMEOUT = 90_000
+export const unconfirmedPi = (o: Outgoing): Outgoing => ({ ...o, state: 'failed', error: PI_UNCONFIRMED, noRetry: true, ambiguous: true, offline: undefined, up: undefined })
 /** one still sending (on this screen or another, or a reload ago) fails after this: it keeps trying by itself until
  *  then (uploads.ts GIVE_UP) */
 const KEEP_SENDING = GIVE_UP + 60_000
@@ -95,10 +102,10 @@ export function settle(out: Outgoing[], chat: Chat, now = Date.now()): Outgoing[
       return [{ ...o, state: 'sent' as const, waiting: true, queued: true, error: undefined, lost: undefined }]
     }
     // the server says it couldn't go in (not one sent again since: that is on its way once more)
-    const failed = o.state === 'sent' && chat.failed?.find((f) => f.cid === o.cid)
+    const failed = (o.state === 'sent' || o.piInFlight) && chat.failed?.find((f) => f.cid === o.cid)
     if (failed) {
       changed = true
-      return [{ ...o, state: 'failed' as const, error: failed.error, waiting: undefined, queued: undefined }]
+      return [{ ...o, state: 'failed' as const, error: failed.error, noRetry: failed.noRetry, ambiguous: failed.ambiguous, piInFlight: undefined, waiting: undefined, queued: undefined }]
     }
     // it waited and is gone from the queue: it went in, and shows again until the log has it
     if (o.queued) {
@@ -187,6 +194,7 @@ export function expire(out: Outgoing[], now: number, working: (chat: string) => 
     }
     const fail = (error: string, lost?: boolean) => {
       changed = true
+      if (o.piInFlight || (o.pi && o.state === 'sent')) return unconfirmedPi(o)
       return { ...o, state: 'failed' as const, error, lost }
     }
     if (o.state === 'sending' && now - o.at > KEEP_SENDING) return fail("Couldn't reach Shepherdr.")

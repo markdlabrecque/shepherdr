@@ -7,6 +7,7 @@ import type { Hub } from "./hub.ts";
 import { sh } from "./model.ts";
 import { ChatReader } from "../core/chat-reader.js";
 import { reportMsg, subagentsOf } from "../core/chat-view.js";
+import { failedOf } from "./send-once.ts";
 
 /** A page following a chat: told the reader (and the terminal now) each time the conversation changes. */
 export type Watcher = (reader: ChatReader, terminal: any) => void;
@@ -19,7 +20,9 @@ type Followed = { reader: ChatReader; pages: Set<Watcher>; busy: boolean; idleSi
   /** what its CLI said it does when last told (the working line's words while no call is open in its log) */
   said?: string;
   /** its subagents as last told (SHEP-54): one starting, changing state or ending is news for its chat */
-  kids?: string };
+  kids?: string;
+  /** a held Pi send can fail without any change to Pi's snapshot */
+  piFailures?: string };
 
 /** a screen that keeps drawing (a spinner) asks for a read at most this often */
 const NUDGE = 200;
@@ -35,7 +38,7 @@ function readerFor(io: any, addr: string) {
  *  machine's always, and this machine's too on some herdr-core versions (#748). hc get has it, asked at most every
  *  10 s per terminal. */
 const fg = new Map<string, { at: number; foreground: any }>();
-async function withForeground(addr: string, t: any) {
+export async function withForeground(addr: string, t: any) {
   if (!t || t.foreground?.pid || t.state !== "live") return t;
   let c = fg.get(addr);
   if (!c || Date.now() - c.at > 10_000) {
@@ -134,6 +137,10 @@ export class Chats {
       let changed = await f.reader.locate(t);
       if (await f.reader.pull()) changed = true;
       if (await f.reader.lookJobs()) changed = true;
+      if (f.reader.kind === "pi" || f.piFailures) {
+        const failures = JSON.stringify(failedOf(addr));
+        if (failures !== f.piFailures) { f.piFailures = failures; changed = true; }
+      }
       // its CLI says it does something else now (a status change, no new line in its log): told too
       const said = reportMsg(t);
       if (said !== f.said) { f.said = said; changed = true; }

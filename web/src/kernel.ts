@@ -759,7 +759,8 @@ export async function act(a: Action, signal?: AbortSignal) {
   // with its status: a proxy's 502 is the network (uploads.ts transient), the server's own no is not
   if (!r.ok) {
     noteUsage('error', { type: a.type, status: r.status })
-    throw new HttpError(r.status, (await r.text()) || `${r.status}`)
+    const send = r.headers.get('x-shepherdr-send')
+    throw new HttpError(r.status, (await r.text()) || `${r.status}`, send === 'unconfirmed' || send === 'refused' ? send : undefined)
   }
   return r.json().catch(() => ({}))
 }

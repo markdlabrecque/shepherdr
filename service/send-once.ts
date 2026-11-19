@@ -40,7 +40,10 @@ export function once(cid: string, go: (again: boolean) => Promise<unknown>): Pro
   const d = load();
   for (const [k, v] of d) if (Date.now() - v.at > KEEP) d.delete(k);
   const was = d.get(cid);
-  if (was) return Promise.resolve(was.result);
+  if (was) {
+    const failure = was.result as { refusedSend?: string; ambiguous?: boolean };
+    return failure?.refusedSend ? Promise.reject(sendError(failure.refusedSend, true, !!failure.ambiguous)) : Promise.resolve(was.result);
+  }
   const on = going.get(cid);
   if (on) return on;
   const p = go(stuck.has(cid));
@@ -55,24 +58,35 @@ export function once(cid: string, go: (again: boolean) => Promise<unknown>): Pro
     },
     (e) => {
       going.delete(cid);
-      if ((e as { stuck?: boolean })?.stuck) stuck.add(cid);
+      if ((e as { noRetry?: boolean })?.noRetry) remember(cid, { refusedSend: e.message, ambiguous: !!e.ambiguous });
+      else if ((e as { stuck?: boolean })?.stuck) stuck.add(cid);
     },
   );
   return p;
 }
 
 /** held messages that couldn't go once the agent was free, by agent address: the page shows them failed with Retry */
-const heldFailed = new Map<string, { cid: string; error: string; at: number }[]>();
-export function noteFailed(addr: string, cid: string, error: string, stayed = false) {
+type FailedSend = { cid: string; error: string; noRetry?: boolean; ambiguous?: boolean };
+const heldFailed = new Map<string, (FailedSend & { at: number })[]>();
+export function sendError(message: string, noRetry = false, ambiguous = false) {
+  return Object.assign(new Error(message), { noRetry, ambiguous });
+}
+export function remember(cid: string, result: unknown) {
+  load().set(cid, { at: Date.now(), result });
+  save();
+}
+
+export function noteFailed(addr: string, cid: string, error: string, stayed = false, noRetry = false, ambiguous = false) {
   // it stayed in Claude Code's box: its Retry presses Enter only
   if (stayed) stuck.add(cid);
   // its Retry goes again (its answer was "held", not "in")
-  if (load().delete(cid)) save();
+  if (noRetry) remember(cid, { refusedSend: error, ambiguous });
+  else if (load().delete(cid)) save();
   const list = (heldFailed.get(addr) ?? []).filter((f) => f.cid !== cid && Date.now() - f.at < KEEP);
-  heldFailed.set(addr, [...list, { cid, error, at: Date.now() }]);
+  heldFailed.set(addr, [...list, { cid, error, ...(noRetry ? { noRetry } : {}), ...(ambiguous ? { ambiguous } : {}), at: Date.now() }]);
 }
-export function failedOf(addr: string | null | undefined): { cid: string; error: string }[] {
-  return (heldFailed.get(addr ?? "") ?? []).filter((f) => Date.now() - f.at < KEEP).map(({ cid, error }) => ({ cid, error }));
+export function failedOf(addr: string | null | undefined): FailedSend[] {
+  return (heldFailed.get(addr ?? "") ?? []).filter((f) => Date.now() - f.at < KEEP).map(({ at, ...failure }) => failure);
 }
 
 /** tests: a restart (what is on disk is read again) */

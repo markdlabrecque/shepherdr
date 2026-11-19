@@ -30,7 +30,8 @@ import { chatPane, chatLabel } from "./core/spaces.js";
 import * as fs from "fs/promises";
 import { FIND, LOG, Conversation, records, resultText, summary, excerpt, names, pilotLine } from "./core/chat-log.js";
 import { BgJobs } from "./core/bg-jobs.js";
-import { ChatReader } from "./core/chat-reader.js";
+import { ChatReader, kindOf } from "./core/chat-reader.js";
+import { piTarget, piSend, piRequestId, PI_UNAVAILABLE, PI_BLOCKED } from "./core/pi-chat.js";
 import { preview } from "./core/recipe.js";
 import { words, howAnswered, codexOnScreen, codexSteps } from "./core/asks.js";
 // The rows' words and rules the web app's chat draws by too (core/chat-view.js).
@@ -961,6 +962,7 @@ export default class Chat extends View {
 
   // The agent's status. Parked behind this chat it isn't in agents(); the core's word then.
   status() {
+    if (this.kind === "pi") return this.piReader?.pi?.state ?? null;
     const a = agents().find((x) => x.address === this.addr);
     if (a) return a.status;
     const k = terminals().find((x) => x.address === this.addr);
@@ -1148,10 +1150,26 @@ export default class Chat extends View {
     const pane = this.lastPane ?? (this.slot && this.slotRec()?.pane) ?? null;
     if (!this.thread && !this.inner && !this.swapping && !t.labels?.["herdr.chat"] && pane && !panes().some((p) => p.terminal === this.addr)
       && panes().some((p) => p.pane === pane && p.mod === "chat")) await hc(["label", this.addr, `herdr.chat=${chatLabel(pane)}`]);
-    const kind = KINDS[t.status?.app] ?? KINDS[t.foreground?.name];
+    const kind = kindOf(t);
     // Back at its shell because the session it resumed is gone: a new agent starts there.
-    if (!kind) { if (!(await this.checkLost(this.addr, cx, t))) this.set("unsupported", cx); return; }
+    if (!kind) {
+      this.piReader = null;
+      if (!(await this.checkLost(this.addr, cx, t))) this.set("unsupported", cx);
+      return;
+    }
     this.t = t;
+    if (kind === "pi") {
+      if (this.kind !== "pi" || this.piReader?.addr !== this.addr) {
+        this.path = null;
+        this.reset();
+        this.kind = kind;
+        this.piReader = new ChatReader({ sh: (script, args, on) => exec("sh", ["-c", script, ...args], { on, timeout: 10 }) }, this.addr);
+      }
+      if (await this.piReader.locate(t)) this.set("finding", cx);
+      return;
+    }
+    this.piReader = null;
+    if (this.kind === "pi") { this.kind = null; this.reset(); this.set("finding", cx); }
     this.loadFirst(cx, t.labels);
     this.argv = t.foreground?.argv ?? t.argv ?? null;
     const pid = t.foreground?.pid;
@@ -1233,6 +1251,15 @@ export default class Chat extends View {
 
   // The newest page first; after that, what the log gained since.
   async pull(cx) {
+    if (this.kind === "pi" && this.piReader?.addr === this.addr) {
+      const reader = this.piReader;
+      if (!await reader.pull() || this.piReader !== reader || this.addr !== reader.addr) return;
+      this.conv = reader.conv;
+      this.settlePending();
+      this.phase = reader.pi ? "ready" : "pi-unavailable";
+      cx.notify();
+      return;
+    }
     if (!this.path) return;
     const path = this.path;
     if (this.start === null) {
@@ -1361,10 +1388,10 @@ export default class Chat extends View {
         await this.flag();
         // Its own start screen, while it has no session (or a card is still open).
         const k = this.ownTerminal();
-        if (k && (starting(k) || openCard(this.addr))) { await this.screens.tick(this.addr, k); cx.notify(); }
+        if (this.kind !== "pi" && k && (starting(k) || openCard(this.addr))) { await this.screens.tick(this.addr, k); cx.notify(); }
         // The first message hc couldn't hand over (startAgent): once the agent is idle with no screen to answer.
         if (this.firstSend && k?.turn > 0) this.firstSend = null;
-        if (this.firstSend && k?.status?.state === "idle" && !openCard(this.addr)) {
+        if (this.kind !== "pi" && this.firstSend && k?.status?.state === "idle" && !openCard(this.addr)) {
           const text = this.firstSend;
           this.firstSend = null;
           const sent = await personHc(["send", this.addr, text]).catch(() => null);
@@ -1387,7 +1414,7 @@ export default class Chat extends View {
         if (this.watching?.dir !== dir) this.watching = { dir, next: watchFolder(dir).finally(() => { this.watching = null; }) };
         await Promise.race([this.watching.next, cx.sleep(4000)]);
       } else {
-        await cx.sleep(working ? 1500 : 4000);
+        await cx.sleep(this.kind === "pi" ? 1000 : working ? 1500 : 4000);
       }
     }
   }
@@ -1397,13 +1424,18 @@ export default class Chat extends View {
   // Enter: now (while the agent works, it takes it mid-turn). Ctrl+Enter while it
   // works: held, and sent by itself once it is free.
   send(cx, hold = false) {
+    if (this.kind === "pi" && (this.phase !== "ready" || (!hold && this.status() === "blocked"))) return;
     // A picked "#space" goes as its mention, which names its target (core/mentions.js).
     const text = mentions.expandTasks(mentions.expand(this.box.value().trim(), this.picked), this.pickedTasks);
     this.picked = [];
     this.pickedTasks = [];
     // Also while the agent asks in its terminal: the words answer it there (deliver()).
     if (!text && !this.files.length) return;
-    const msg = { id: `m${Date.now()}`, text, files: this.files, quote: this.quote };
+    const msg = { id: this.kind === "pi" ? piRequestId() : `m${Date.now()}`, text, files: this.files, quote: this.quote, hold };
+    if (this.kind === "pi") {
+      msg.pi = piTarget(this.piReader?.pid, this.piReader?.pi);
+      msg.piAddr = this.addr;
+    }
     this.box.set_value("");
     // If the textarea still adds Enter's new line after this, take it out again.
     cx.timer.after(30, () => { if (!this.box.value().trim()) this.box.set_value(""); });
@@ -1413,9 +1445,9 @@ export default class Chat extends View {
     // /model (with or without a name) never reaches the CLI, which would keep it as the default
     // for every later agent: it opens the model picker instead, that model chosen.
     const mm = !msg.files.length && /^\/model(?:\s+(\S+))?\s*$/i.exec(text);
-    if (mm) { this.quote = msg.quote; this.modelCommand(mm[1] ?? null, cx); this.saveSoon(cx); cx.notify(); return; }
+    if (mm && this.kind !== "pi") { this.quote = msg.quote; this.modelCommand(mm[1] ?? null, cx); this.saveSoon(cx); cx.notify(); return; }
     note("send", { n: msg.files.length });
-    if (hold && this.status() === "working") this.queue.push(msg);
+    if (hold && (this.status() === "working" || (this.kind === "pi" && this.status() === "blocked"))) this.queue.push(msg);
     else this.deliver(msg, cx);
     this.saveSoon(cx);
     this.pinned = true;
@@ -1441,61 +1473,82 @@ export default class Chat extends View {
   drainQueue(cx) {
     if (!this.queue.length || this.phase !== "ready") return;
     const st = this.status();
-    if (st === "working" || st === "blocked" || this.asks.length || openCard(this.addr) || this.pending.some((p) => !p.failed && !p.late)) return;
+    if (st === "working" || st === "blocked" || (this.kind !== "pi" && (this.asks.length || openCard(this.addr))) || this.pending.some((p) => !p.failed && !p.late)) return;
     const msg = this.queue.shift();
-    if (msg.raw) personHc(["send", this.addr, msg.text]);
+    if (msg.raw && this.kind !== "pi") personHc(["send", this.addr, msg.text]);
     else this.deliver(msg, cx);
     this.saveSoon(cx);
     cx.notify();
   }
 
   deliver(msg, cx) {
+    const wasPi = "pi" in msg;
+    const kind = wasPi ? "pi" : this.kind, addr = this.addr;
     // /model never reaches the CLI by any way in (held, or sent by another mod): send() says why.
     const mm = !msg.files?.length && /^\/model(?:\s+(\S+))?\s*$/i.exec(msg.text ?? "");
-    if (mm) { this.modelCommand(mm[1] ?? null, cx); return; }
-    if (this.phase === "fresh") { this.startAgent(msg, cx); return; }
+    if (mm && kind !== "pi") { this.modelCommand(mm[1] ?? null, cx); return; }
+    if (this.phase === "fresh" && !wasPi) { this.startAgent(msg, cx); return; }
     // The CLI shows its own start screen (a card here): typed words could pick one of its
     // choices, so they wait until it is answered (drainQueue()).
-    if (openCard(this.addr)) { this.queue.push(msg); return; }
+    if (kind !== "pi" && openCard(this.addr)) { this.queue.push(msg); return; }
     // A card asks (a question, a permission, a plan): the words answer it, as typing in the
     // CLI would (cards.js replyWith); the card's buttons still work too.
-    if (this.asks.length && msg.text && !msg.files?.length) {
+    if (kind !== "pi" && this.asks.length && msg.text && !msg.files?.length) {
       this.replied = [...this.replied.slice(-20), { id: msg.id, text: msg.text, at: Date.now() }];
       this.cards.replyWith(this.asks[0], msg.text, cx);
       return;
     }
     // Herdr tag lines before the words: the message it replies to, the tasks it mentions.
     const body = messageBody({ text: msg.text, quote: msg.quote?.text ?? null, tags: this.taskTags(msg.text) });
-    const p = { id: `pending-${msg.id}`, text: msg.text, replyTo: msg.quote ? excerpt(msg.quote.text, 80) : null, files: msg.files.filter((f) => !f.image).map((f) => f.name),
-      paths: msg.files.filter((f) => f.image).map((f) => f.path), at: Date.now(), sent: body,
+    const files = msg.files ?? [];
+    const p = { id: `pending-${msg.id}`, text: msg.text, replyTo: msg.quote ? excerpt(msg.quote.text, 80) : null, files: files.filter((f) => !f.image).map((f) => f.name),
+      paths: files.filter((f) => f.image).map((f) => f.path), at: Date.now(), sent: body,
       match: norm(msg.text).slice(0, 60) || null, msg };
     this.pending.push(p);
-    const menu = msg.files.length ? null : slash.opensMenu(this.kind, msg.text);
+    const isSamePi = () => this.kind === "pi" && addr === msg.piAddr && this.addr === addr && this.piReader?.pid === msg.pi?.pid;
+    if (kind === "pi" && (!wasPi || !msg.pi || !isSamePi())) {
+      p.failed = wasPi && !msg.pi ? PI_UNAVAILABLE : "The terminal changed before this message could be sent. Open it before writing a new message.";
+      p.noRetry = true;
+      cx.notify();
+      return;
+    }
+    const menu = kind === "pi" || files.length ? null : slash.opensMenu(kind, msg.text);
     if (menu) this.note = { id: `note-${msg.id}`, text: `/${menu} opens a menu in the terminal. Switching to it.` };
     cx.spawn(async (cx) => {
       let r;
       try {
-        const paths = await attach.deliver(msg.files, this.addr, this.machine);
+        const paths = await attach.deliver(files, addr, this.machine);
         p.sent = [body, ...paths].filter(Boolean).join("\n\n");
         // (a message with pictures: its Enter again if Claude Code lost it, sendTyped(); one that stayed in its box
         // last time gets only its Enter now, never typed twice)
-        r = await sendTyped(this.sendIo(cx), this.addr, this.kind, p.sent, SETTLE, !!msg.stuck);
+        const io = this.sendIo(cx);
+        io.pi = (value) => isSamePi()
+          ? piSend((...a) => this.piExec(...a), addr, msg.pi, msg.id, value, msg.hold ? "hold" : "now")
+          : { code: 1, stderr: "Pi is no longer running in this terminal.", noRetry: true };
+        r = await sendTyped(io, addr, kind, p.sent, SETTLE, !!msg.stuck);
+        if (r.waiting) {
+          this.pending = this.pending.filter((x) => x !== p);
+          this.queue.unshift(msg);
+          this.saveSoon(cx);
+          cx.notify();
+          return;
+        }
         msg.stuck = !!r.stuck;
         // Its own dialog is open in its terminal (a question or a permission with no card
         // here): the words answer it the "Reply instead…" way.
-        if (r.code !== 0 && refusal(r).kind === "blocked" && (this.kind === "claude" || this.kind === "codex")) r = await this.replyInstead(p.sent, cx);
+        if (r.code !== 0 && refusal(r).kind === "blocked" && (kind === "claude" || kind === "codex")) r = await this.replyInstead(p.sent, cx);
       } catch (e) {
         r = { code: 1, stderr: String(e?.message ?? e) };
       }
       // Kept as a bubble that sends again when pressed (clickRow), so nothing is lost.
-      if (r.code !== 0) { p.failed = refusal(r).message; cx.notify(); return; }
+      if (r.code !== 0) { p.failed = refusal(r).message; p.noRetry = r.noRetry; p.ambiguous = r.ambiguous; cx.notify(); return; }
       // In the agent's terminal now: it's sent. The log has it only once taken, so it shows as
       // sent from here.
       p.delivered = true;
       cx.notify();
       // Mid-turn, Claude Code holds a typed message until its turn ends ("ctrl+enter to send
       // now"): send it now, so the agent takes it at once (it steers).
-      if (this.kind === "claude") await this.steerNow(cx);
+      if (kind === "claude") await this.steerNow(cx);
       if (menu) {
         // A command with its own menu: show it where it works, the terminal.
         await cx.sleep(900);
@@ -1533,7 +1586,24 @@ export default class Chat extends View {
     return last ? `It said: ${last.slice(0, 200)}` : "";
   }
 
+  async piExec(script, args, on, input) {
+    // Herdr's exec has no stdin. Keep the prompt out of argv and off disk on the agent's machine.
+    const tmp = await exec("mktemp", ["-d", "/tmp/shepherdr-pi-send.XXXXXXXX"]);
+    if (tmp.code !== 0) throw new Error("Can't prepare Pi message.");
+    const dir = tmp.stdout.trim(), file = `${dir}/message`;
+    try {
+      await writeTextFile(file, input, null);
+      const local = 'f=$1; shift; exec "$@" < "$f"';
+      const cmd = ["sh", "-c", script, ...args];
+      return await exec("sh", ["-c", local, "pi-chat", file, ...(on ? ["hc", "exec", "--on", on, "--stdin", "--timeout", "10", "--", ...cmd] : cmd)], { timeout: 15 });
+    } finally {
+      await exec("rm", ["-f", file]).catch(() => {});
+      await exec("rmdir", [dir]).catch(() => {});
+    }
+  }
+
   retry(p, cx) {
+    if (p.noRetry || p.ambiguous) return;
     this.pending = this.pending.filter((x) => x !== p);
     this.deliver(p.msg, cx);
   }
@@ -1564,9 +1634,10 @@ export default class Chat extends View {
 
   // A held message sent at once (the agent takes it mid-turn).
   sendQueued(msg, cx) {
+    if (this.kind === "pi" && this.status() === "blocked") return;
     this.queue = this.queue.filter((m) => m !== msg);
-    if (msg.raw) personHc(["send", this.addr, msg.text]);
-    else this.deliver(msg, cx);
+    if (msg.raw && this.kind !== "pi") personHc(["send", this.addr, msg.text]);
+    else this.deliver({ ...msg, hold: false }, cx);
     this.saveSoon(cx);
   }
 
@@ -1623,7 +1694,7 @@ export default class Chat extends View {
       if (tk.length) return tk;
     }
     const w = slash.typing(v);
-    if (w === null || !this.cmds.length) return [];
+    if (this.kind === "pi" || w === null || !this.cmds.length) return [];
     return slash.match(this.cmds, w);
   }
 
@@ -2138,7 +2209,9 @@ export default class Chat extends View {
   // The Coordinator tab's chat empty again, ready to start the next Assistant.
   startFresh() {
     this.endedAssistant = false;
-    this.addr = null; this.path = null; this.reset(); this.phase = "fresh";
+    this.addr = null; this.path = null;
+    if (this.kind === "pi") { this.kind = null; this.piReader = null; }
+    this.reset(); this.phase = "fresh";
   }
 
   // Restart Assistant, after its agent ended (GitHub #1039): the same conversation resumed, with its flags, parked
@@ -2328,6 +2401,7 @@ export default class Chat extends View {
   // the prompts with the newest last (Up once per later prompt); Codex's Esc Esc browses the
   // transcript from the last prompt (Left once per later prompt). Then the terminal shows it.
   rewind(row, cx) {
+    if (this.kind === "pi") return;
     if (this.status() === "working") { toast({ title: "The agent is working", body: "Stop it first, then rewind.", level: "info" }); return; }
     const users = (this.conv?.items ?? []).filter((x) => x.kind === "user" && !x.from && !/^\//.test(x.text ?? ""));
     const i = users.findIndex((u) => u.id === row.of);
@@ -2348,6 +2422,7 @@ export default class Chat extends View {
 
   // A copy of this conversation, continued in a new tab of this space (the CLI's own fork).
   fork(cx) {
+    if (this.kind === "pi") return;
     const session = agent.sessionOf(this.kind, this.path);
     if (!session) { toast({ title: "Can't fork", body: "This conversation has no saved session.", level: "info" }); return; }
     const tab = panes().find((p) => p.pane === this.myPane())?.tab;
@@ -2727,7 +2802,7 @@ export default class Chat extends View {
   // ---- model button and picker -----------------------------------------------------------------
 
   current() {
-    if (!this.kind) return null;
+    if (!this.kind || this.kind === "pi") return null;
     // A resumed conversation's log names the model it ran on before: until this process
     // writes, its arguments and settings say what it runs on.
     let meta = this.conv?.meta ?? {};
@@ -2782,6 +2857,7 @@ export default class Chat extends View {
   // menu that chooses what it starts on), with the model named chosen. Without a picker (no
   // pane, no agent yet) it only says why nothing went.
   modelCommand(name, cx) {
+    if (this.kind === "pi") return;
     const b = this.composerAt;
     if (this.phase === "fresh") {
       if (!this.choice?.sel || !this.choice?.data) return;
@@ -2805,6 +2881,7 @@ export default class Chat extends View {
 
   // Restarts the agent with what the picker chose; this chat follows the new one.
   applyPick(pick, cx) {
+    if (this.kind === "pi") return;
     if (this.thread) return this.switchTask(pick, cx);
     const mine = this.myPane();
     if (this.restarting || !mine || !this.t) return;
@@ -3021,7 +3098,7 @@ export default class Chat extends View {
         // Its actions in a band row under it (the row above draws them too: band()).
         if (x.text) {
           const bar = { id: `b:${x.id}`, of: x.id, target: x.text, text: x.text, side: "user", at: x.at, pills: this.pills(x.id),
-            acts: bandActs("user", x.text, { from: x.from }) };
+            acts: bandActs("user", x.text, { from: x.from, rewind: this.kind !== "pi" }) };
           out[out.length - 1] = { ...out[out.length - 1], bar };
           out.push({ kind: "band", id: `ab:${x.id}`, bar });
         }
@@ -3057,7 +3134,7 @@ export default class Chat extends View {
         // under its last row.
         if (!(working && i === items.length - 1) && out.length > first) {
           const bar = { id: `b:${x.id}`, of: x.id, target: x.text, text: x.text, side: "agent", at: x.at, pills: this.pills(x.id),
-            acts: bandActs("agent", x.text, { fork: Boolean(this.kind) }) };
+            acts: bandActs("agent", x.text, { fork: Boolean(this.kind) && this.kind !== "pi" }) };
           out[out.length - 1] = { ...out[out.length - 1], bar };
           out.push({ kind: "band", id: `ab:${x.id}`, bar });
         }
@@ -3078,7 +3155,7 @@ export default class Chat extends View {
       const from = out.length;
       if (p.replyTo) out.push({ kind: "replyref", id: `rr:${p.id}`, to: p.replyTo, of: p.id, side: "user" });
       const queued = !p.waiting && p.delivered && inQueue.has(norm(p.text));
-      out.push({ kind: "pending", id: p.id, text: p.text, files: p.files, failed: p.failed, late: p.late, waiting: p.waiting, delivered: p.delivered });
+      out.push({ kind: "pending", id: p.id, text: p.text, files: p.files, failed: p.failed, noRetry: p.noRetry, ambiguous: p.ambiguous, late: p.late, waiting: p.waiting, delivered: p.delivered });
       if (p.paths?.length) out.push({ kind: "imgs", id: `i:${p.id}`, paths: p.paths, faded: !p.delivered });
       if (queued) out.push(this.queuedLine(p.id));
       block(from, p.id);
@@ -3175,7 +3252,7 @@ export default class Chat extends View {
 
   // Whose ask a card shows: the CLI's short name ("Claude asks").
   cli() {
-    return this.kind === "codex" ? "Codex" : "Claude";
+    return this.kind === "pi" ? "Pi" : this.kind === "codex" ? "Codex" : "Claude";
   }
 
   // The empty box's words: whom it writes to.
@@ -3320,7 +3397,8 @@ export default class Chat extends View {
         return pad(v_flex().w_full().items_end().gap(3)
           .when(Boolean(x.text), (el) => el.child(bubble(x.text, !x.delivered || Boolean(x.failed))))
           .when(x.files?.length > 0, (el) => el.child(fileLine(x.files.join(", "))))
-          .when(Boolean(x.failed), (el) => el.child(div().text_size(12).text_color(t.blocked).cursor_pointer().child(notSent(x.failed))))
+          .when(Boolean(x.failed), (el) => el.child(div().text_size(12).text_color(t.blocked)
+            .when(!x.noRetry, (line) => line.cursor_pointer()).child(x.noRetry ? x.failed : notSent(x.failed))))
           .when(!x.failed && x.late, (el) => el.child(div().text_size(12).text_color(t.dim).child(WORDS.late)))
           .when(!x.failed && Boolean(x.waiting), (el) => el.child(div().text_size(12).text_color(t.dim).child(x.waiting))));
       case "replyref":
@@ -3567,6 +3645,7 @@ export default class Chat extends View {
 
   // What the agent says it waits for (its status report), e.g. "Do you prefer tea or coffee? (Tea · Coffee)".
   asking() {
+    if (this.kind === "pi") return PI_BLOCKED;
     const msg = reportMsg(terminals().find((x) => x.address === this.addr));
     return msg ? msg.replace(/^answer:\s*/i, "").trim() : null;
   }
@@ -3580,7 +3659,7 @@ export default class Chat extends View {
 
   statusLine(t, st) {
     // A card asks (in the timeline, where it appeared): nothing under the conversation repeats it.
-    if (this.asks.length || this.sasks?.some((a) => !a.kept) || (this.addr && openCard(this.addr))) return null;
+    if (this.kind !== "pi" && (this.asks.length || this.sasks?.some((a) => !a.kept) || (this.addr && openCard(this.addr)))) return null;
     // The agent this chat is starting, before it says anything.
     if ((this.phase === "starting" || this.phase === "finding") && this.role && this.pending.length) {
       return h_flex().id("chat-status").flex_none().w_full().max_w(COLUMN + 36).mx_auto().h(30).px(18).gap(8).items_center().text_size(12).text_color(t.muted)
@@ -3611,6 +3690,9 @@ export default class Chat extends View {
           .child(svg("mods/chat/stop-chip.svg").size(8).flex_none())
           .child(div().child("Stop"))
           .child(div().text_size(11).text_color(t.dim).child("Esc")));
+    }
+    if (this.kind === "pi" && st === "error") {
+      return div().flex_none().w_full().max_w(COLUMN + 28).mx_auto().px(14).pt(6).text_size(12).text_color(t.muted).child("Pi reported an error. Check the terminal.");
     }
     if (st === "blocked") {
       return div().flex_none().w_full().max_w(COLUMN + 28).mx_auto().px(14).pt(6).child(h_flex().px(12).py(10).gap(10).items_center().rounded(10)
@@ -3845,7 +3927,7 @@ export default class Chat extends View {
         .child(v_flex().flex_1().min_w(0)
           .child(div().truncate().text_size(12.5).text_color(t.foreground).child(m.label ?? (m.text || m.files.map((f) => f.name).join(", "))))
           .child(div().truncate().text_size(12).text_color(t.dim).child(WORDS.queued)))
-        .child(ghost(`queued-now-${m.id}`, WORDS.sendNow,(cx) => this.sendQueued(m, cx)))
+        .when(this.kind !== "pi" || this.status() !== "blocked", (el) => el.child(ghost(`queued-now-${m.id}`, WORDS.sendNow, (cx) => this.sendQueued(m, cx))))
         .child(ghost(`queued-edit-${m.id}`, "Edit", (cx) => this.editQueued(m, cx)))
         .child(div().id(`queued-x-${m.id}`).size(22).flex_none().flex().items_center().justify_center().rounded(6).cursor_pointer().text_color(t.dim)
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
@@ -4244,7 +4326,7 @@ export default class Chat extends View {
         .child(Textarea.new(this.box).w_full().text_size(13).text_color(t.foreground)
           .when(Boolean(this.boxSpare && this.lineH), (el) => el.mb(-this.lineH)))
         .when(!this.box.value().trim(), (el) => el.child(div().absolute().top(9).left(12).text_size(13).text_color(t.dim)
-          .child(this.asks.length || st === "blocked" ? WORDS.replyInstead : this.placeholder()))))
+          .child(this.kind === "pi" && st === "blocked" ? PI_BLOCKED : this.asks.length || st === "blocked" ? WORDS.replyInstead : this.placeholder()))))
       // While recording: the recording row. Else one row, on the right: what the agent runs on
       // (opens the picker), dictation, Send (or Call). Send never turns into Stop: while the
       // agent works it still sends (or queues) and calls; Stop is on the working line above.
@@ -4253,12 +4335,13 @@ export default class Chat extends View {
         // Attach on the left, as ChatGPT and Claude have it: the desktop's file picker.
         .child(this.round("chat-attach", "mods/chat/plus.svg", t, "ghost", (cx) => this.pickFiles(cx)))
         .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.blocked).child(rec === "idle" ? this.dict.error ?? "" : ""))
-        .when(Boolean(this.addr), (el) => el.children(this.pickParts(t, true)))
+        .when(Boolean(this.addr) && this.kind !== "pi", (el) => el.children(this.pickParts(t, true)))
         .when(!this.addr && this.phase === "fresh" && Boolean(this.choice?.sel) && Boolean(cx), (el) => el.child(this.freshPick(t, cx)))
         .when(addonOn("voice"), (el) => el.child(this.round("chat-mic", "mods/chat/mic.svg", t, "ghost", (cx) => this.toggleDictation(cx))))
         // Always Send (SHEP-108): quiet with nothing to send, filled once there is. A call is with
         // Shepherdr itself, from the top of the sidebar (SHEP-105), never from a chat's box.
-        .child(this.round("chat-send", "mods/chat/send.svg", t, can ? "solid" : "off", can ? (cx) => this.send(cx) : null)))));
+        .child(this.round("chat-send", "mods/chat/send.svg", t, can && !(this.kind === "pi" && st === "blocked") ? "solid" : "off",
+          can && !(this.kind === "pi" && st === "blocked") ? (cx) => this.send(cx) : null)))));
   }
 
   // ---- alerts ---------------------------------------------------------------------------------
@@ -4498,6 +4581,7 @@ export default class Chat extends View {
     if (this.phase === "ended" && !this.swapping) return root.child(this.notice(t, WORDS.agentEnded, null, [
       this.button("chat-close", "Close chat", null, "secondary", t, () => this.closeSelf())]));
     const open = this.button("chat-open-terminal", WORDS.openTerminal,"mods/workspace-chrome/terminal.svg", "primary", t, () => this.toTerminal());
+    if (this.phase === "pi-unavailable") return root.child(this.notice(t, "Pi chat integration unavailable", PI_UNAVAILABLE, [open]));
     if (this.phase === "unsupported") return root.child(this.notice(t, WORDS.unsupported, WORDS.unsupportedBody, [open]));
     if (this.phase === "none") return root.child(this.notice(t, WORDS.notFound, WORDS.notFoundBody, [open]));
     if ((this.phase === "finding" && !starting) || this.phase === "ended") return root.child(this.notice(t, this.swapping ? WORDS.restarting : WORDS.opening, null));

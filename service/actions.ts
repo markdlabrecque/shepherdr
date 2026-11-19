@@ -18,10 +18,12 @@ const { READ, withMove, withSection, withoutSection, withSectionName, withIcon, 
 import type { Compat } from "./compat.ts";
 import { worktreeAct } from "./worktrees.ts";
 import { layoutScript } from "./layout-scripts.ts";
-import { noteFailed, once } from "./send-once.ts";
+import { noteFailed, once, remember, sendError } from "./send-once.ts";
 import { execTemplate } from "./spaces.ts";
 import * as MA from "../core/machine-add.js";
-import { exec } from "./model.ts";
+import { exec, sh } from "./model.ts";
+import { withForeground } from "./chats.ts";
+import { piSnapshot, piTarget, piSend, piRequestId, PI_UNAVAILABLE } from "../core/pi-chat.js";
 import { closeSaved, renameSaved, orderSaved, withoutSpace, splitId } from "./saved-spaces.ts";
 
 // The window's own space log (lib/spacelog.js): a space the service closed or renamed with no window is traced there too
@@ -47,7 +49,7 @@ async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
   const text = str(b.text ?? "").trim();
   if (!text && !(Array.isArray(b.attachments) && b.attachments.length)) throw new Error("nothing to send");
   const t = hub.terminals.get(a);
-  if (!t || t.state !== "live") throw new Error("That agent isn't running.");
+  if (!t || t.state !== "live") throw sendError("That agent isn't running.", b.pi === true);
   const io = { hc: asPerson(hub), sleep: (ms: number) => Bun.sleep(ms), status: () => (hub.terminals.get(a) as any)?.status?.state ?? null };
   // files sent with it: their paths after the words, as the window's chat sends them (copied first to another machine)
   const sent: string[] = Array.isArray(b.attachments) ? b.attachments : [];
@@ -64,6 +66,32 @@ async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
     return landed;
   }));
   const body = [messageBody({ text, quote: typeof b.quote === "string" ? b.quote.slice(0, 2000) : null, tags: typeof b.tags === "string" ? b.tags : "" }), ...files].filter(Boolean).join("\n\n");
+  const terminal = await withForeground(a, t);
+  const cli = kindOf(terminal);
+  if (b.pi === true && cli !== "pi") throw sendError("Pi is no longer running in this terminal. Check the terminal before writing a new message.", true);
+  if (cli === "pi") {
+    const pid = terminal?.foreground?.pid;
+    const snapshot = await piSnapshot((script: string, args: string[], on: string | null) => sh(hub, script, args, on), a, pid);
+    const target = piTarget(pid, snapshot);
+    if (!target) throw sendError(PI_UNAVAILABLE, true);
+    const cid = typeof b.cid === "string" && b.cid ? b.cid.slice(0, 80) : piRequestId();
+    const note = () => { const at = Date.now(); compat.noteSend?.(a, { cid, text, files: sent, at }); return at; };
+    const deliver = async (mode: string) => {
+      const current = await withForeground(a, hub.terminals.get(a));
+      if (current?.state !== "live" || kindOf(current) !== "pi" || current.foreground?.pid !== pid)
+        return { code: 1, stderr: "Pi is no longer running in this terminal. Check the terminal before writing a new message.", noRetry: true };
+      return piSend((script: string, args: string[], on: string | null, input: string) =>
+        exec(hub, ["sh", "-c", script, ...args], on, 10, input), a, target, cid, body, mode);
+    };
+    const r = await deliver(b.hold ? "hold" : "now");
+    if (r.code !== 0) throw sendError(refusal(r).message, !!r.noRetry, !!r.ambiguous);
+    if (r.waiting) {
+      held.push({ addr: a, kind: "pi", body, hub, cid, note, pi: deliver });
+      drain();
+      return { ok: true, waiting: true, waitsFor: "turn" };
+    }
+    return { ok: true, at: note() };
+  }
   // held on purpose (Ctrl+Enter, a long press): it goes once the agent stops working
   const st = (hub.terminals.get(a) as any)?.status?.state;
   if (b.hold && (st === "working" || st === "blocked")) {
@@ -85,7 +113,7 @@ async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
 }
 
 // Messages held until their agent is free, sent in order, each once.
-const held: { addr: string; kind: string; body: string; hub: Hub; cid?: string; now?: boolean; note?: () => void }[] = [];
+const held: { addr: string; kind: string; body: string; hub: Hub; cid?: string; now?: boolean; sending?: boolean; note?: () => number | void; pi?: (mode: string) => Promise<any> }[] = [];
 let draining: ReturnType<typeof setInterval> | null = null, busy = false;
 function drain() {
   draining ??= setInterval(async () => {
@@ -96,6 +124,19 @@ function drain() {
       for (const m of [...held]) {
         const st = (m.hub.terminals.get(m.addr) as any)?.status?.state;
         const alive = m.hub.terminals.get(m.addr)?.state === "live";
+        if (m.pi) {
+          if (!held.includes(m)) continue;
+          m.sending = true;
+          const r = await m.pi(m.now ? "now" : "hold").finally(() => { m.sending = false; });
+          if (r.waiting) continue;
+          const i = held.indexOf(m);
+          if (i >= 0) held.splice(i, 1);
+          if (r.code === 0) {
+            const at = m.note?.();
+            if (m.cid) remember(m.cid, { ok: true, at });
+          } else if (m.cid) noteFailed(m.addr, m.cid, refusal(r).message, false, !!r.noRetry, !!r.ambiguous);
+          continue;
+        }
         if (alive && !m.now && (st === "working" || st === "blocked")) continue;
         const i = held.indexOf(m);
         if (i < 0) continue;
@@ -378,6 +419,7 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     // the model menu: what it runs on and its choices (model-menu: the window's, mods/chat-models); a restart on
     // another model, effort, speed, permission mode or CLI
     const a = chat(b.chat), reader = compat.reader?.(a);
+    if (reader?.kind === "pi" || kindOf(await withForeground(a, hub.terminals.get(a))) === "pi") throw new Error("Change Pi settings in the terminal.");
     if (b.type === "restart-info") return compat.agents.info(a, reader);
     if (b.type === "model-menu") return { ok: true, menu: await (compat.agents as any).menu(a, reader) };
     if (!["claude", "codex"].includes(b.kind)) throw new Error("Pick Claude Code or Codex.");
@@ -440,6 +482,7 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     // a queued message (the window's Send now and ×): sent at once, or taken back unsent
     const m = held.find((x) => x.cid === b.cid);
     if (!m) throw new Error("That message has gone in already.");
+    if (m.sending) throw new Error("This message is being sent. Wait for Pi to answer.");
     if (b.type === "held-drop") held.splice(held.indexOf(m), 1);
     else { m.now = true; drain(); }
     return { ok: true };
@@ -532,6 +575,7 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     // the CLI's own rewind on that message, as the window's: Claude Code's /rewind lists the prompts newest last (Up
     // once per later prompt); Codex's Esc Esc browses back from the last (Left). Then its terminal shows it.
     const a = chat(b.chat), t: any = hub.terminals.get(a), r = compat.reader?.(a);
+    if (r?.kind === "pi" || kindOf(await withForeground(a, t)) === "pi") throw new Error("Rewind Pi in the terminal.");
     if (t?.status?.state === "working") throw new Error("The agent is working: stop it first, then rewind.");
     const users = (r?.conv?.items ?? []).filter((x: any) => x.kind === "user" && !x.from && !/^\//.test(x.text ?? ""));
     const i = users.findIndex((u: any) => u.id === b.message), back = i < 0 ? 1 : users.length - i;
@@ -547,7 +591,9 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
   if (b?.type === "fork" && typeof b.chat === "string") {
     // a copy of the conversation in a new tab of its space, through the CLI's own fork (the window makes the tab)
     const a = chat(b.chat), t: any = hub.terminals.get(a), r = compat.reader?.(a);
-    const kind = kindOf(t) ?? "claude", session = sessionOf(kind, r?.path ?? null);
+    const kind = kindOf(await withForeground(a, t)) ?? "claude";
+    if (r?.kind === "pi" || kind === "pi") throw new Error("Fork Pi in the terminal.");
+    const session = sessionOf(kind, r?.path ?? null);
     if (!session) throw new Error("This conversation has no saved session to fork.");
     // #1050: the task's agent still runs in that folder: the person says first whether a second agent should
     if (!b.force && liveTaskAgent(t, hub.terminals.values())) return { ok: false, ask: FORK_LIVE };
@@ -560,6 +606,8 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     const res = await hc(["keys", chat(b.chat), ...b.keys]);
     return { ok: res.code === 0 };
   }
+  if (b?.type === "send" && b.pi === true && typeof b.chat === "string" && !compat.addrOf(b.chat))
+    throw sendError("Pi is no longer running in this terminal. Check the terminal before writing a new message.", true);
   if (b?.type === "send" && typeof b.chat === "string" && b.chat.startsWith("p:") && !compat.addrOf(b.chat)) {
     // a space's Assistant chat with no Assistant yet: the first message starts it (the assistant template) with the
     // message as its task, as the window's empty Assistant chat does (mods/chat startAgent): in the window's slot for

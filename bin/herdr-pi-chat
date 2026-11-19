@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Send one request to a local Pi process and print one JSON result."""
+import json
+import os
+import re
+import socket
+import stat
+import sys
+import time
+from pathlib import Path
+
+MAX_FRAME = 128 * 1024
+MAX_BODY = 32 * 1024
+
+
+class Failure(Exception):
+    pass
+
+
+class Unconfirmed(Exception):
+    """A send may have reached Pi, but there is no usable acknowledgement."""
+
+
+def token(value):
+    return isinstance(value, str) and re.fullmatch(r"[!-~]{1,256}", value) is not None
+
+
+def private(info, kind, mode):
+    return kind(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == mode
+
+
+def discover(pid):
+    uid = os.geteuid()
+    raw_path = (os.environ.get("SHEPHERDR_PI_RUNTIME_DIR") or f"/tmp/shepherdr-pi-{uid}").rstrip("/")
+    if not os.path.isabs(raw_path) or os.path.basename(raw_path) in ("", ".", ".."):
+        raise Failure("unsafe_runtime")
+    path = Path(raw_path)
+    parent = path.parent.resolve(strict=True)
+    for directory in (parent, *parent.parents):
+        info = directory.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, uid)
+                or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            raise Failure("unsafe_runtime")
+    directory = parent / path.name
+    address = directory / f"{pid}.sock"
+    if len(os.fsencode(address)) > 103:
+        raise Failure("socket_path_too_long")
+    if not private(directory.lstat(), stat.S_ISDIR, 0o700):
+        raise Failure("unsafe_runtime")
+    path = directory / f"{pid}.json"
+    if not private(path.lstat(), stat.S_ISREG, 0o600):
+        raise Failure("unsafe_registry")
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as record:
+        if not private(os.fstat(record.fileno()), stat.S_ISREG, 0o600):
+            raise Failure("unsafe_registry")
+        raw = record.read(1025)
+    try:
+        data = json.loads(raw.decode("utf-8")) if len(raw) <= 1024 else None
+    except (ValueError, RecursionError):
+        data = None
+    if (not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1
+            or type(data.get("pid")) is not int or data["pid"] != pid or not token(data.get("instance"))):
+        raise Failure("invalid_registry")
+    if not private(address.lstat(), stat.S_ISSOCK, 0o600):
+        raise Failure("unsafe_socket")
+    os.kill(pid, 0)
+    return str(address), data["instance"]
+
+
+def encode(value):
+    return (json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+
+def read_send():
+    raw = sys.stdin.buffer.read(MAX_FRAME + 1)
+    if len(raw) > MAX_FRAME:
+        raise Failure("request_too_large")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        instance, session, leaf, request_id, body, mode = (
+            data[key] for key in ("instance", "session", "leaf", "id", "body", "mode")
+        )
+        if (not all(map(token, (instance, session, request_id))) or (leaf is not None and not token(leaf))
+                or mode not in ("now", "hold") or not isinstance(body, str) or not body.strip() or "\0" in body):
+            raise ValueError
+        if len(body.encode("utf-8")) > MAX_BODY:
+            raise Failure("request_too_large")
+    except (ValueError, TypeError, KeyError, RecursionError):
+        raise Failure("invalid_request") from None
+    return {"instance": instance, "session": session, "leaf": leaf, "id": request_id, "body": body, "mode": mode}
+
+
+def exchange(address, request):
+    frame = encode(request)
+    if len(frame) > MAX_FRAME:
+        raise Failure("request_too_large")
+    with socket.socket(socket.AF_UNIX) as conn:
+        deadline = time.monotonic() + 3
+        conn.settimeout(3)
+        conn.connect(address)
+        try:
+            conn.settimeout(max(0.001, deadline - time.monotonic()))
+            conn.sendall(frame)
+            raw = bytearray()
+            while len(raw) < MAX_FRAME:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                conn.settimeout(remaining)
+                chunk = conn.recv(min(8192, MAX_FRAME - len(raw)))
+                if not chunk:
+                    break
+                line, newline, _ = chunk.partition(b"\n")
+                raw.extend(line)
+                if newline:
+                    return json.loads(raw.decode("utf-8"))
+            raise Failure("invalid_response")
+        except (OSError, ValueError, RecursionError, Failure) as exc:
+            if request["op"] == "send":
+                raise Unconfirmed from exc
+            raise
+
+
+def result_for(args):
+    if len(args) != 2 or args[0] not in ("snapshot", "send") or not re.fullmatch(r"[1-9][0-9]{0,9}", args[1]):
+        raise Failure("usage")
+    op, pid = args[0], int(args[1])
+    if pid > 2**31 - 1:
+        raise Failure("usage")
+    fields = read_send() if op == "send" else {}
+    address, instance = discover(pid)
+    if fields and fields["instance"] != instance:
+        raise Failure("stale_instance")
+    result = exchange(address, {**fields, "op": op, "pid": pid, "instance": instance})
+    if isinstance(result, dict) and result.get("ok") is False and token(result.get("error")):
+        if op == "send" and result["error"] in ("pi_error", "response_too_large"):
+            raise Unconfirmed
+        return {"ok": False, "error": result["error"]}
+    if op == "send":
+        if isinstance(result, dict) and result.get("ok") is True and result.get("status") in ("accepted", "queued", "waiting"):
+            return {"ok": True, "status": result["status"]}
+        raise Unconfirmed
+    if isinstance(result, dict) and result.get("ok") is True:
+        if op == "snapshot" and result.get("instance") == instance and token(result.get("session")):
+            if ("leaf" in result and (result["leaf"] is None or token(result["leaf"]))
+                    and result.get("state") in ("idle", "working", "blocked", "error")
+                    and isinstance(result.get("items"), list) and len(result["items"]) <= 20):
+                items = []
+                for item in result["items"]:
+                    if (not isinstance(item, dict) or not token(item.get("id"))
+                            or item.get("role") not in ("user", "assistant") or not isinstance(item.get("text"), str)
+                            or type(item.get("at")) is not int or abs(item["at"]) > 8_640_000_000_000_000):
+                        raise Failure("invalid_response")
+                    items.append({key: item[key] for key in ("id", "role", "text", "at")})
+                return {**{key: result[key] for key in ("ok", "instance", "session", "leaf", "state")}, "items": items}
+    raise Failure("invalid_response")
+
+
+def main():
+    try:
+        result = result_for(sys.argv[1:])
+        out = encode(result)
+        if len(out) > MAX_FRAME:
+            raise Failure("invalid_response")
+        sys.stdout.buffer.write(out)
+        return 0 if result["ok"] else 1
+    except Unconfirmed:
+        sys.stdout.buffer.write(encode({"ok": False, "error": "unconfirmed", "ambiguous": True}))
+        return 1
+    except Failure as exc:
+        code = str(exc)
+    except (FileNotFoundError, ProcessLookupError, ConnectionRefusedError):
+        code = "not_available"
+    except TimeoutError:
+        code = "timeout"
+    except OSError:
+        code = "ipc_error"
+    except (ValueError, RecursionError):
+        code = "invalid_response"
+    sys.stdout.buffer.write(encode({"ok": False, "error": code}))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

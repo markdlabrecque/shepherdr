@@ -606,6 +606,17 @@ export function claudeSwitch(text) {
   return null;
 }
 
+export function piConversation(items) {
+  const conv = new Conversation("pi");
+  for (const x of items) {
+    if (typeof x?.id !== "string" || typeof x.text !== "string") continue;
+    const at = typeof x.at === "number" ? x.at : Date.parse(x.at ?? "") || undefined;
+    if (x.role === "user") conv.user(x.id, { ...cleanUser(x.text), at });
+    else if (x.role === "assistant" || x.role === "error") conv.push({ kind: x.role === "error" ? "error" : "agent", id: x.id, text: x.text, at });
+  }
+  return conv;
+}
+
 export class Conversation {
   constructor(kind) {
     this.kind = kind;
@@ -885,7 +896,8 @@ export class Conversation {
       }
       const l = parse(r.data);
       if (!l || typeof l !== "object") continue;
-      if (this.kind === "codex") this.codex(l, r.off); else this.claude(l, r.off);
+      if (this.kind === "codex") this.codex(l, r.off);
+      else if (this.kind !== "pi") this.claude(l, r.off);
     }
   }
 

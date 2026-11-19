@@ -23,7 +23,7 @@ const { WORDS, clock, initialOf, bandActs, bandOrder, imagesLine, fitThumbs, THU
   questionsBelow: (n: number) => string
   clock: (at?: number) => string
   initialOf: (name: string) => string
-  bandActs: (side: 'user' | 'agent', text?: string, o?: { from?: string | null; fork?: boolean }) => string[]
+  bandActs: (side: 'user' | 'agent', text?: string, o?: { from?: string | null; fork?: boolean; rewind?: boolean }) => string[]
   bandOrder: (side: 'user' | 'agent', acts: string[], o?: { time?: boolean; react?: boolean }) => string[]
   imagesLine: (n: number) => string
   fitThumbs: (sizes: ({ w: number; h: number } | null)[], width?: number) => { boxes: { w: number; h: number }[]; h: number }
@@ -49,7 +49,7 @@ export const onTerminal = (fn: (chat: string) => void) => void (showTerminal = f
 export function Band({ msg, chat, cli }: { msg: Message; chat: string; cli?: boolean }) {
   const you = msg.who === 'you'
   const { copied, copy } = useCopy()
-  const acts = bandActs(you ? 'user' : 'agent', msg.text, { fork: cli !== false })
+  const acts = bandActs(you ? 'user' : 'agent', msg.text, { fork: cli !== false, rewind: cli !== false })
   const react = has('reactions')
   const pills = msg.reactions?.length ? registry.messageEdge.map(({ View }, i) => <View key={i} msg={msg} chat={{ key: chat } as Chat} />) : null
   const time = clock(msg.at)
@@ -250,15 +250,15 @@ export function Notice({ chat, resume }: { chat: Chat; resume?: () => Promise<un
   const [busy, setBusy] = useState(false)
   const n = chat.notice!
   const task = /\/worker$/.test(chat.key)
-  const title = n === 'opening' ? WORDS.opening : n === 'unsupported' ? WORDS.unsupported : n === 'none' ? WORDS.notFound : task ? WORDS.taskEnded : WORDS.agentEnded
-  const body = n === 'unsupported' ? WORDS.unsupportedBody : n === 'none' ? WORDS.notFoundBody : null
+  const title = n === 'pi-unavailable' ? 'Pi chat integration unavailable' : n === 'opening' ? WORDS.opening : n === 'unsupported' ? WORDS.unsupported : n === 'none' ? WORDS.notFound : task ? WORDS.taskEnded : WORDS.agentEnded
+  const body = n === 'pi-unavailable' ? 'Install the Shepherdr integration, then run /reload in Pi.' : n === 'unsupported' ? WORDS.unsupportedBody : n === 'none' ? WORDS.notFoundBody : null
   const btn = 'press-dim flex h-7 items-center gap-1.5 rounded-[7px] px-2.5 text-[0.78125rem] font-medium phone:h-10'
   return (
     <div role="status" data-notice={n} className="flex flex-1 flex-col items-center justify-center gap-1.5 px-6 text-center">
       <TermIcon className="size-[18px] text-fg3" />
       <div className="pt-1 font-medium text-fg">{title}</div>
       {body ? <div className="max-w-[360px] text-[0.78125rem] text-fg2">{body}</div> : null}
-      {n === 'unsupported' || n === 'none' ? (
+      {n === 'unsupported' || n === 'none' || n === 'pi-unavailable' ? (
         <div className="pt-2"><button type="button" onClick={() => showTerminal(chat.key)} className={clsx(btn, 'bg-fg text-bg')}><TermIcon className="size-3.5" />{WORDS.openTerminal}</button></div>
       ) : n === 'ended' && task && resume ? (
         <div className="pt-2"><button type="button" disabled={busy} onClick={() => { setBusy(true); void resume().finally(() => setBusy(false)) }} className={clsx(btn, 'bg-fg text-bg disabled:opacity-60')}>{busy ? WORDS.resuming : 'Resume'}</button></div>
