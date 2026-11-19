@@ -43,7 +43,7 @@ import { dirs } from "./dirs.js";
 // into its starting prompt; Herdr runs nothing itself.
 import { SECTIONS, ROLES, NOTES, MERGE, MUST_FIX, ROUNDS, ARCHIVE, ABOUT, BACKUP, REACTIONS, upgradeReactions, NOTIFY_ABOUT, TITLE, SPACE_TITLE,
   EVERYWHERE, CHANGED_HERE, RESET, EDIT_INSTRUCTIONS, USE_OTHER_CLI, LOADING_AGENTS, SAVED, sameAs as sameAsWords,
-  spacesOwn, otherCliWords, backupProblem, notifyMachineAbout, machineLabel, TASK_ROWS, LEVEL } from "./core/settings.js";
+  spacesOwn, roleSel, backupProblem, notifyMachineAbout, machineLabel, TASK_ROWS, LEVEL } from "./core/settings.js";
 
 const I = (name) => `mods/shepherdr-settings/${name}.svg`;
 // A page's title, and a Tasks row's (by its key, section.field).
@@ -312,22 +312,15 @@ export default class ShepherdrSettings extends View {
 
   // The CLI a worker runs here, and the other one (an unset Reviewer and Backup use it).
   otherCli() {
-    const worker = shepherdrFor(this.cfg, this.scope).worker?.agent ?? "claude";
-    return worker === "codex" ? "claude" : "codex";
+    const worker = shepherdrFor(this.cfg, this.scope).worker?.agent ?? "pi";
+    return worker === "pi" ? "pi" : worker === "codex" ? "claude" : "codex";
   }
 
-  // The model buttons start from what applies in this scope. An unset role shows what runs: the
-  // CLI's own defaults, and for the Reviewer the other CLI's (its button says "Other CLI").
+  // Each role starts from its saved Pi selection, otherwise Pi's own defaults.
   resetRoles() {
     const eff = shepherdrFor(this.cfg, this.scope);
     for (const r of ROLES) {
-      let sel = eff[r.id] ?? null;
-      const unset = !sel;
-      if (!sel && r.id === "reviewer" && this.data?.menus?.[this.otherCli()]) {
-        const o = this.otherCli();
-        sel = { agent: o, model: this.data.menus[o].models[0]?.id ?? null, effort: null, fast: false, perm: this.data.permDefault?.[o] ?? null };
-      }
-      sel ??= this.data?.defaults ?? null;
+      const { sel, unset } = roleSel(r.id, eff[r.id] ?? null, this.data, "pi");
       this.roles[r.id] = { ...(this.roles[r.id] ?? {}), sel: sel ? { ...sel } : null, data: this.data, saved: JSON.stringify(sel), unset };
     }
   }
@@ -492,12 +485,10 @@ export default class ShepherdrSettings extends View {
   }
 
   // A role: its model button and, on Everywhere, "Edit instructions" (the same for every space).
-  // An unset Reviewer's button says what runs: "Other CLI (Codex)".
   roleRow(t, r, cx) {
     const c = this.roles[r.id];
-    const label = r.id === "reviewer" && c?.unset ? otherCliWords(this.otherCli()) : undefined;
     const control = h_flex().gap(8).items_center()
-      .child(c?.sel ? models.modelButton(t, c, { label }, cx) : div().text_size(TEXT.label).text_color(t.dim).child(LOADING_AGENTS))
+      .child(c?.sel ? models.modelButton(t, c, {}, cx) : div().text_size(TEXT.label).text_color(t.dim).child(LOADING_AGENTS))
       .when(!this.scope && r.id === "reviewer" && c && !c.unset,
         (el) => el.child(button("reviewer-other", USE_OTHER_CLI, { kind: "plain", onClick: (_e, cx) => this.reset("reviewer", null, cx) })))
       .when(!this.scope, (el) => el.child(button(`edit-${r.id}`, EDIT_INSTRUCTIONS,

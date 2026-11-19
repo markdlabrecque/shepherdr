@@ -26,8 +26,8 @@ import { theme, props, setShared, closeOverlay, home, readTextFile, writeTextFil
 import { modelSections, parsePicks, pickKey, withPin, withRecent, PICKS_FILE, permAcross, speedFor, speedName } from "./core/agents.js";
 import { dirs } from "./dirs.js";
 
-const AGENTS = ["claude", "codex"];
-const LEVEL = { minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max", ultra: "Ultra", none: "None" };
+const AGENTS = ["pi", "claude", "codex"];
+const LEVEL = { off: "Off", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max", ultra: "Ultra", none: "None" };
 // Sizes, as the chat counts them for the overlay's height (mods/chat openPicker): the model list
 // scrolls past LIST; NOTE is a quiet line (an offline machine's; a new conversation's, two lines).
 export const ROW = 31, HEAD = 26, SEP = 9, SEG = 34, FOOT = 33, TABS = 34, SEARCH = 36, LIST = 8 * 31, NOTE = 20, STAR = 20;

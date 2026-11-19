@@ -7,6 +7,7 @@ import { existsSync, readFileSync, renameSync, watch, writeFileSync } from "node
 import { dirname, join } from "node:path";
 import { HOME, settingsFile, where, writableSettings } from "./paths.ts";
 import * as C from "../core/settings.js";
+import { piRoleModel } from "../core/agents.js";
 import { SH } from "../core/paths.js";
 import * as M from "../core/machines.js";
 import * as HC from "../core/host.js";
@@ -189,7 +190,7 @@ export class Settings {
 
   private agents(s: Scope | null): SettingSection {
     const scope = s?.id ?? null;
-    const worker = this.pick(scope, "worker", null).value?.agent ?? "claude";
+    const worker = this.pick(scope, "worker", null).value?.agent ?? "pi";
     const menus = this.choices?.menus;
     const rows: SettingRow[] = ROLES.map((r) => {
       const p = this.pick(scope, r.id, null);
@@ -197,7 +198,7 @@ export class Settings {
       const button = (v: any) => {
         if (!this.choices) return LOADING_AGENTS;
         const { sel, unset } = roleSel(r.id, v ?? null, this.choices, worker);
-        return unset && r.id === "reviewer" && sel ? otherCliWords(otherCli(worker)) : sel ? modelLabel(menus, sel) : LOADING_AGENTS;
+        return sel ? modelLabel(menus, sel) : LOADING_AGENTS;
       };
       const { sel, unset } = roleSel(r.id, p.value ?? null, this.choices, worker);
       // on Everywhere its row has "Edit instructions" too (the same for every space), and a set Reviewer "Use other CLI"
@@ -444,12 +445,10 @@ export class Settings {
       let v: any = null;
       if (word !== null) {
         try { v = JSON.parse(word); } catch { throw new Error("Not an agent."); }
-        const ok = (x: unknown) => x == null || (typeof x === "string" && /^[\w.\[\]-]{1,60}$/.test(x));
-        if (!["claude", "codex"].includes(v?.agent) || !ok(v.model) || !ok(v.effort)) throw new Error("Pick Claude Code or Codex.");
-        // its permission mode, as the window's Permissions pick (one of the CLI's modes; none: the CLI's own default)
-        const PERM: Record<string, string[]> = { claude: ["manual", "auto", "acceptEdits", "plan", "bypassPermissions"], codex: ["read-only", "auto", "full"] };
-        if (v.perm != null && !PERM[v.agent].includes(v.perm)) throw new Error("Not one of its permission modes.");
-        v = { agent: v.agent, model: v.model ?? null, effort: v.effort ?? null, fast: v.fast === "ultrafast" && v.agent === "codex" ? "ultrafast" : !!v.fast, perm: v.perm ?? null };
+        const ok = (x: unknown) => x == null || (typeof x === "string" && /^[\w./:\[\]-]{1,200}$/.test(x));
+        if (v?.agent !== "pi" || !ok(v.model) || (v.model != null && !piRoleModel(v.model))) throw new Error("Pick a supported Pi model.");
+        if (v.effort != null && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(v.effort)) throw new Error("Not a Pi thinking level.");
+        v = { agent: "pi", model: v.model ?? null, effort: v.effort ?? null, fast: false, perm: null };
       }
       put(field, null, v);
     } else if (section === "autopilot" && AP.FIELDS.includes(field)) {

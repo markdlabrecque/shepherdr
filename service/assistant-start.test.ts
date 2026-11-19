@@ -35,6 +35,12 @@ test("the Assistant runs the agent its settings choose, with its model, effort a
   expect(t.words).toBe("You are the Assistant.");
 });
 
+test("Pi Assistant keeps the selected provider, model and thinking level without permission flags", async () => {
+  const { hub, made } = machine(["pi"]);
+  await execTemplate(hub, "assistant", null, { agent: "pi", model: "openai/gpt-5.5", effort: "off", fast: false, perm: null });
+  expect(commandOf(made()[0])).toMatch(/exec pi --model openai\/gpt-5\.5 --thinking off\s*$/);
+});
+
 test("no choice: the template's own command, as before", async () => {
   const { hub, made } = machine(["claude"]);
   await execTemplate(hub, "assistant", null, null);
