@@ -216,6 +216,14 @@ class Bridge(Scratch):
         self.assertNotEqual(moved["generation"], held["generation"])
         self.assertEqual(self.cli("send", held)["error"], "stale_leaf")
         self.assertEqual(self.control("idle", True), [])
+        at_destination = self.fields(id="destination", body="stay on the destination")
+        self.control("stream", "destination live reply")
+        live = self.cli("snapshot", self.cursor(moved))
+        self.control("tree", "assistant-1")
+        after_hook = self.cli("snapshot", self.cursor(live))
+        self.assertFalse(after_hook["reset"])
+        self.assertEqual(after_hook["live"], live["live"])
+        self.assertEqual(self.cli("send", at_destination)["status"], "queued")
 
     def test_guard_blocked_stale_leaf_session_and_instance(self):
         fields = self.fields()

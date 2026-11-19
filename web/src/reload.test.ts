@@ -14,3 +14,9 @@ test('a Pi reload cache with no saved quote keeps an empty reply map', () => {
   const pi: Chat = { key: 'pi', cli: 'pi', messages: [] }
   expect(withoutPiHistory({ chats: { pi } })).toEqual({ chats: {}, reply: {} })
 })
+
+test('a reload cache does not restore quotes from missing chats', () => {
+  const text = { missing: 'saved draft' }
+  const reply = { missing: { id: 'old', text: 'previous Pi branch' } }
+  expect(withoutPiHistory({ reply, text })).toEqual({ chats: {}, reply: {}, text })
+})

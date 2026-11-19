@@ -968,7 +968,7 @@ function keep(st: State, text: Record<string, string>) {
   } catch {
     // too much to keep (a long chat): what was open and typed still comes back
     try {
-      sessionStorage.setItem('shepherdr.kept', JSON.stringify(k))
+      sessionStorage.setItem('shepherdr.kept', JSON.stringify({ ...k, reply: {} }))
     } catch {
       /* private window: the reload still brings the newest screen */
     }

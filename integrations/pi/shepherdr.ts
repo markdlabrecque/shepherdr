@@ -167,7 +167,6 @@ function fileStamp(path: string, old?: { identity: string; size: number; changed
 export default function (pi: ExtensionAPI) {
   let stop: (() => Promise<void>) | undefined;
   let blocked = false;
-  let revision: (() => void) | undefined;
   let observe: (() => void) | undefined;
   type Stream = { id: string; manager: ExtensionContext["sessionManager"]; session: string; leaf: string | null };
   let live: (Stream & { message: Assistant }) | undefined;
@@ -182,7 +181,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("ui_prompt_start", () => { blocked = true; });
   pi.on("ui_prompt_end", () => { blocked = false; });
   pi.on("session_before_tree", () => { observe?.(); });
-  pi.on("session_tree", () => { revision?.(); });
+  pi.on("session_tree", () => { observe?.(); });
   pi.on("message_start", ({ message }, ctx) => {
     if (message.role !== "assistant") return;
     finishLive();
@@ -221,7 +220,7 @@ export default function (pi: ExtensionAPI) {
     let index = indexBranch(branch);
     const aliases = new Map<string, string>();
     let refresh = true;
-    revision = () => { generation = randomUUID(); refresh = true; clearLive(); aliases.clear(); };
+    const revision = () => { generation = randomUUID(); refresh = true; clearLive(); aliases.clear(); };
     function current(sample = false) {
       const session = manager.getSessionId();
       const leaf = manager.getLeafId() ?? null;
@@ -230,7 +229,7 @@ export default function (pi: ExtensionAPI) {
       const file = fileMark(path, stamp);
       const changed = !first && (session !== lastSession || lastPath !== path || file.replaced);
       stamp = file.stamp;
-      if (changed) revision?.();
+      if (changed) revision();
       if (refresh || leaf !== lastLeaf) {
         const entries = manager.getEntries();
         branch = manager.getBranch();
@@ -241,7 +240,7 @@ export default function (pi: ExtensionAPI) {
           const added = entries.slice(lastCount);
           const suffix = branch.slice(parent + 1);
           if ((lastLeaf !== null && parent < 0) || !added.length || suffix.length !== added.length ||
-              !added.every((e, i) => e.id === suffix[i].id && e.type !== "branch_summary")) revision?.();
+              !added.every((e, i) => e.id === suffix[i].id && e.type !== "branch_summary")) revision();
         }
         index = indexBranch(branch);
         lastCount = entries.length;
@@ -273,7 +272,8 @@ export default function (pi: ExtensionAPI) {
       return { instance, session, leaf, generation };
     }
 
-    // Sample the old leaf and entry count before Pi installs the navigation target.
+    // Sample the leaf before and after navigation, using the same observer as a socket poll so
+    // a delayed session_tree hook cannot invalidate an already published destination a second time.
     observe = () => { current(true); };
 
     function dispatch(value: unknown) {
@@ -388,7 +388,7 @@ export default function (pi: ExtensionAPI) {
     const cleanup = async () => {
       if (stop !== cleanup) return;
       stop = undefined;
-      revision = observe = undefined;
+      observe = undefined;
       clearLive();
       for (const socket of sockets) socket.destroy();
       try { unlink(registry); }

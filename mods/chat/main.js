@@ -627,8 +627,11 @@ export default class Chat extends View {
     if (!d) return;
     if (d.text && !this.box.value()) this.box.set_value(d.text);
     this.files = Array.isArray(d.files) ? d.files : [];
-    this.quote = this.kind === "pi" ? (d.quote?.piHistory ? d.quote : null) : d.quote ?? null;
-    if (this.kind === "pi" && this.piReader?.pi) this.quote = piQuoteFor(this.quote, this.piReader.pi);
+    const saved = d.quote ?? null;
+    if (saved?.piHistory) {
+      this.quote = this.kind === "pi" && this.piReader?.pi ? piQuoteFor(saved, this.piReader.pi)
+        : this.phase === "finding" && (!this.kind || this.kind === "pi") ? saved : null;
+    } else this.quote = this.kind === "pi" ? null : saved;
     this.queue = Array.isArray(d.queue) ? d.queue : [];
     cx.notify();
   }
@@ -1487,9 +1490,9 @@ export default class Chat extends View {
     this.pickedTasks = [];
     // Also while the agent asks in its terminal: the words answer it there (deliver()).
     if (!text && !this.files.length) return;
-    const msg = { id: this.kind === "pi" ? piRequestId() : `m${Date.now()}`, text, files: this.files, quote: this.quote, hold };
+    const quote = this.kind === "pi" ? piQuoteFor(this.quote, this.piReader?.pi) : this.quote?.piHistory ? null : this.quote;
+    const msg = { id: this.kind === "pi" ? piRequestId() : `m${Date.now()}`, text, files: this.files, quote, hold };
     if (this.kind === "pi") {
-      msg.quote = piQuoteFor(msg.quote, this.piReader?.pi);
       msg.pi = piTarget(this.piReader?.pid, this.piReader?.pi);
       msg.piAddr = this.addr;
     }
@@ -1556,9 +1559,10 @@ export default class Chat extends View {
       return;
     }
     // Herdr tag lines before the words: the message it replies to, the tasks it mentions.
-    const body = messageBody({ text: msg.text, quote: msg.quote?.text ?? null, tags: this.taskTags(msg.text) });
+    const quote = kind === "pi" ? piQuoteFor(msg.quote, msg.pi) : msg.quote?.piHistory ? null : msg.quote;
+    const body = messageBody({ text: msg.text, quote: quote?.text ?? null, tags: this.taskTags(msg.text) });
     const files = msg.files ?? [];
-    const p = { id: `pending-${msg.id}`, text: msg.text, replyTo: msg.quote ? excerpt(msg.quote.text, 80) : null, files: files.filter((f) => !f.image).map((f) => f.name),
+    const p = { id: `pending-${msg.id}`, text: msg.text, replyTo: quote ? excerpt(quote.text, 80) : null, files: files.filter((f) => !f.image).map((f) => f.name),
       paths: files.filter((f) => f.image).map((f) => f.path), at: Date.now(), sent: body,
       match: norm(msg.text).slice(0, 60) || null, msg };
     this.pending.push(p);
@@ -1714,7 +1718,7 @@ export default class Chat extends View {
     const now = this.box.value().trim();
     this.box.set_value(now ? `${msg.text}\n\n${now}` : msg.text);
     this.addFiles(msg.files);
-    if (msg.quote && !this.quote) this.quote = this.kind === "pi" ? piQuoteFor(msg.quote, this.piReader?.pi) : msg.quote;
+    if (msg.quote && !this.quote) this.quote = this.kind === "pi" ? piQuoteFor(msg.quote, this.piReader?.pi) : msg.quote.piHistory ? null : msg.quote;
     this.box.focus();
     this.saveSoon(cx);
   }
@@ -1835,7 +1839,7 @@ export default class Chat extends View {
     const named = props()?.template ?? this.role;
     const template = named === "coordinator" ? "assistant" : named;
     // No message (the header's Terminal): the template alone.
-    const reply = msg?.quote ? `<hc reply-to="${excerpt(msg.quote.text, 80)}"/>\n` : "";
+    const reply = msg?.quote && !msg.quote.piHistory ? `<hc reply-to="${excerpt(msg.quote.text, 80)}"/>\n` : "";
     // Files here go as their paths; on another machine they follow once it runs (hc put needs it).
     const local = machine || !msg ? [] : msg.files.map((f) => f.path);
     const task = msg ? [reply + msg.text, ...local].filter(Boolean).join("\n\n") : "";

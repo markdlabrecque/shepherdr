@@ -17,10 +17,9 @@ export type Kept = Partial<UI> & { text?: Record<string, string>; snap?: Snapsho
 // Pi can change its active branch without changing the terminal's address. Neither its transcript
 // nor a selected quote should render before the new socket verifies what the terminal is showing.
 export function withoutPiHistory(kept: Kept): Kept {
-  const pi = new Set(Object.entries(kept.chats ?? {}).filter(([, chat]) => chat.cli === 'pi').map(([key]) => key))
-  if (!pi.size) return kept
-  const chats = Object.fromEntries(Object.entries(kept.chats ?? {}).filter(([key]) => !pi.has(key)))
-  const reply = Object.fromEntries(Object.entries(kept.reply ?? {}).filter(([key]) => !pi.has(key)))
+  const chats = Object.fromEntries(Object.entries(kept.chats ?? {}).filter(([, chat]) => chat.cli !== 'pi'))
+  // A quote without its chat (including the storage-quota fallback) cannot be verified as non-Pi.
+  const reply = Object.fromEntries(Object.entries(kept.reply ?? {}).filter(([key]) => Object.hasOwn(chats, key) && chats[key].cli))
   return { ...kept, chats, reply }
 }
 

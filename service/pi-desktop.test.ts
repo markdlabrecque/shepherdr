@@ -83,7 +83,7 @@ test("desktop held sends keep the old leaf; Send now steers and an unconfirmed s
     addr, kind: "pi", machine: "desktop-remote", phase: "ready", piReader: { pid: 77, pi: snapshot },
     queue: [], pending: [], asks: [{ stale: true }], status: () => "idle", saveSoon() {}, taskTags: () => "", sendIo: () => ({}),
     piExec: async (_: string, args: string[], on: string, input: string) => { sent.push({ args, on, ...JSON.parse(input) }); return answer; },
-    deliver: method("deliver", { messageBody, refusal, sendTyped, piSend, samePiHistory, PI_UNAVAILABLE,
+    deliver: method("deliver", { messageBody, refusal, sendTyped, piSend, piQuoteFor, samePiHistory, PI_UNAVAILABLE,
       attach: { deliver: async () => [] }, norm: (s: string) => s, SETTLE: null,
       openCard: () => { throw new Error("Pi does not use Claude or Codex's cards"); } }),
   };
@@ -131,7 +131,7 @@ test("desktop does not attach a restored quote to a replacement Pi session", asy
     let text = "";
     let sent: any;
     const files = [{ path: "example.txt" }];
-    const self: any = { addr, kind: "pi", phase: "ready", status: () => "idle", piReader: { pid: 77 },
+    const self: any = { addr, kind: "pi", phase: "finding", status: () => "idle", piReader: { pid: 77 },
       pending: [], queue: [], files: [], box: { value: () => text, set_value: (v: string) => { text = v; } },
       saveSoon() {}, deliver: (msg: any) => { sent = msg; } };
     const cx = { notify() {}, timer: { after() {} } };
@@ -139,12 +139,26 @@ test("desktop does not attach a restored quote to a replacement Pi session", asy
       text: "saved words", files, quote: { text: "quoted words", piHistory: saved },
     }) } }).call(self, cx);
     self.piReader.pi = current;
+    self.phase = "ready";
     method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }).call(self, current, cx);
     method("send", { piTarget, piQuoteFor, piRequestId: () => "send", note() {},
       mentions: { expand: (v: string) => v, expandTasks: (v: string) => v } }).call(self, cx);
     expect(sent).toMatchObject({ text: "saved words", files, pi: { session: "current" },
       quote: saved === piHistoryOf(current) ? { text: "quoted words" } : null });
   }
+});
+
+test("a fresh desktop Assistant does not start with a restored Pi quote", async () => {
+  const quote = { text: "the old Pi reply", piHistory: piHistoryOf(snapshot) };
+  const files = [{ path: "example.txt" }];
+  let text = "";
+  let started: any;
+  const self: any = { kind: null, phase: "fresh", box: { value: () => text, set_value: (v: string) => { text = v; } },
+    saveSoon() {}, deliver: method("deliver"), startAgent: (msg: any) => { started = msg; } };
+  const cx = { notify() {}, timer: { after() {} } };
+  await method("loadDraft", { fs: { readFile: async () => JSON.stringify({ text: "saved draft", files, quote }) } }).call(self, cx);
+  method("send", { note() {}, mentions: { expand: (v: string) => v, expandTasks: (v: string) => v } }).call(self, cx);
+  expect(started).toMatchObject({ text: "saved draft", files, quote: null });
 });
 
 test("blocked desktop keeps a draft and Pi-only controls cannot trigger another CLI", () => {
