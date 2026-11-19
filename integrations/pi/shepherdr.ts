@@ -167,6 +167,7 @@ function fileStamp(path: string, old?: { identity: string; size: number; changed
 export default function (pi: ExtensionAPI) {
   let stop: (() => Promise<void>) | undefined;
   let blocked = false;
+  let steerable = false;
   let observe: (() => void) | undefined;
   type Stream = { id: string; manager: ExtensionContext["sessionManager"]; session: string; leaf: string | null };
   let live: (Stream & { message: Assistant }) | undefined;
@@ -180,6 +181,8 @@ export default function (pi: ExtensionAPI) {
   };
   pi.on("ui_prompt_start", () => { blocked = true; });
   pi.on("ui_prompt_end", () => { blocked = false; });
+  pi.on("agent_start", () => { steerable = true; });
+  pi.on("agent_settled", () => { steerable = false; });
   pi.on("session_before_tree", () => { observe?.(); });
   pi.on("session_tree", () => { observe?.(); });
   pi.on("message_start", ({ message }, ctx) => {
@@ -202,6 +205,7 @@ export default function (pi: ExtensionAPI) {
     if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
     await stop?.();
     blocked = false;
+    steerable = false;
     const instance = randomUUID();
     const dir = runtimeDir();
     const address = join(dir, `${pid}.sock`);
@@ -338,8 +342,10 @@ export default function (pi: ExtensionAPI) {
         return error("stale_leaf");
       }
       const busy = !ctx.isIdle();
-      if ((busy || blocked) && mode === "hold") return { ok: true, status: "waiting" };
-      if (blocked) return error("blocked");
+      if (blocked) return mode === "hold" ? { ok: true, status: "waiting" } : error("blocked");
+      // Manual compaction and branch summaries also make Pi non-idle, but reject steering.
+      // Only hand off a busy send to Pi after an agent run has started and before it settles.
+      if (busy && (mode === "hold" || !steerable)) return { ok: true, status: "waiting" };
       if (!ctx.model) return error("no_model");
       const status = busy ? "queued" : "accepted";
       // Pi's API returns void. This acknowledges submission, not persistence or model success.

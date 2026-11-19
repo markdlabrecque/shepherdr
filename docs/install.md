@@ -61,6 +61,22 @@ each `✗` reason, and doctor keeps failing until they're fixed.
 What it refuses: a mod, layout, lib or bin file by the same name that it didn't install and that differs (your own
 mod called `chat`, say). Nothing is written then; it names each one. `--adopt` backs them up and takes them over.
 
+## Pi chat
+
+Install [Pi](https://pi.dev/) separately if you want to use it. Shepherdr's installer and updater add a link named
+`shepherdr.ts` in Pi's `~/.pi/agent/extensions/` and put `herdr-pi-chat` on your PATH. If Pi uses a custom agent directory,
+set `PI_CODING_AGENT_DIR` to that same directory (a path or local `file://` URL) when running `./install.sh` or
+`shepherdr update`. Scratch installs with `--root` use the `.pi/agent` inside the scratch root instead.
+
+After installing or updating, wait for an already open Pi terminal to be idle, then run **`/reload`** to load the
+extension without ending its session. New Pi terminals load it automatically unless started with `--no-extensions`.
+The bridge runs on the machine and under the account that runs Pi, over a private Unix socket. Pi's terminal still
+works as usual; answer Pi's prompts there.
+
+If `shepherdr.ts` already belongs to you, the installer leaves it alone and prints the path it couldn't link. Move
+or rename that file before updating if you want the bridge installed there. `shepherdr uninstall` removes the link it
+created, not your other Pi extensions or settings. Run `/reload` in open Pi terminals to unload the bridge as well.
+
 ## The task browser's agent-browser
 
 Each task's browser runs [agent-browser](https://github.com/vercel-labs/agent-browser). Shepherdr pins a version

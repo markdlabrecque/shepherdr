@@ -60,11 +60,13 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import unquote, urlsplit
 
 VERSION = "3.1.44"
 HERDR_APP_MIN = "0.1.12"
@@ -966,8 +968,16 @@ def unlink_pi_extension(r, rec):
 
 def link_pi_extension(r, rec, home):
     configured = os.environ.get("PI_CODING_AGENT_DIR") if home else None
-    agent = os.path.abspath(os.path.expanduser(configured)) if configured else r.p(".pi/agent")
     try:
+        if configured and configured.startswith("file://"):
+            uri = urlsplit(configured)
+            if (uri.netloc.lower() not in ("", "localhost") or not uri.path.startswith("/")
+                    or re.search(r"%(?:2f|00|(?![0-9a-f]{2}))", uri.path, re.I)):
+                raise ValueError("PI_CODING_AGENT_DIR must be a local file URL or path")
+            configured = unquote(uri.path, errors="strict")
+        elif configured == "~" or (configured and configured.startswith("~/")):
+            configured = os.path.expanduser(configured)
+        agent = os.path.abspath(configured) if configured else r.p(".pi/agent")
         path = pi_extension_path(r, os.path.join(agent, "extensions"))
     except ValueError as e:
         r.notes.append(str(e))
@@ -1422,10 +1432,15 @@ def cmd_uninstall_web(a, root):
             subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT}"], capture_output=True)
         elif not managed_unit(root):   # someone else's unit (#1048) is theirs to stop
             subprocess.run(["systemctl", "--user", "disable", "--now", "shepherdr.service"], capture_output=True)
+    kept_links = set()
     for name, dest in rec.get("links", {}).items():
-        p = r.p(f"{BIN}/{name}")
-        if os.path.islink(p) and os.path.realpath(p) == os.path.realpath(dest) and not a.dry_run:
-            os.remove(p)
+        rel = f"{BIN}/{name}"
+        p = r.p(rel)
+        if os.path.islink(p) and os.path.realpath(p) == os.path.realpath(dest):
+            if not a.dry_run:
+                os.remove(p)
+        elif os.path.lexists(p):
+            kept_links.add(rel)
     for rel, sha in rec.get("files", {}).items():
         if fsha(rel, read(r.p(rel))) == sha and not a.dry_run:
             os.remove(r.p(rel))
@@ -1433,6 +1448,9 @@ def cmd_uninstall_web(a, root):
     for b in reversed(rec.get("backups", [])) if not a.dry_run else []:
         for rel in walk_files(b) + [os.path.relpath(os.path.join(d, x), b) for d, ds, _ in os.walk(b) for x in ds if os.path.islink(os.path.join(d, x))]:
             src, dest = os.path.join(b, rel), r.p(rel)
+            if rel in kept_links:
+                say(f"  kept {rel}; the previous copy is still at {src}")
+                continue
             if os.path.lexists(dest) and not os.path.islink(dest) and rel.startswith(SHARE):
                 continue
             if os.path.lexists(dest):

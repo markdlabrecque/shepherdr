@@ -94,6 +94,51 @@ class Install(unittest.TestCase):
         self.assertFalse(os.path.lexists(extension))
         self.assertFalse(os.path.lexists(self.p(".local/bin/herdr-pi-chat")))
 
+    def test_pi_extension_follows_configured_agent_directory(self):
+        import runpy
+        from unittest import mock
+        from pathlib import Path
+
+        sh = runpy.run_path(SHEPHERDR)
+        install = sh["Run"](os.path.realpath(self.root), False)
+        rec = {}
+        first, second = self.p("first-pi"), self.p("second pi")
+        with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": first}):
+            sh["link_pi_extension"](install, rec, home=True)
+        original = os.path.join(os.path.realpath(first), "extensions", "shepherdr.ts")
+        self.assertTrue(os.path.islink(original), install.notes)
+        self.assertFalse(os.path.lexists(self.p(".pi")))
+        with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": Path(second).as_uri()}):
+            sh["link_pi_extension"](install, rec, home=True)
+        updated = os.path.join(os.path.realpath(second), "extensions", "shepherdr.ts")
+        self.assertFalse(os.path.lexists(original))
+        self.assertTrue(os.path.islink(updated))
+        self.assertEqual(rec["piExtension"], updated)
+        with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": "file://another-host/agent"}):
+            sh["link_pi_extension"](install, rec, home=True)
+        self.assertEqual(rec["piExtension"], updated)
+        self.assertIn("local file URL", install.notes[-1])
+        sh["unlink_pi_extension"](install, rec)
+        self.assertFalse(os.path.lexists(updated))
+
+    def test_web_uninstall_keeps_personal_replacement_pi_helper(self):
+        from pathlib import Path
+
+        helper = Path(self.p(".local/bin/herdr-pi-chat"))
+        helper.parent.mkdir(parents=True)
+        helper.write_text("old personal helper")
+        root = ("--root", self.root)
+        run("install", "--web", *root, "--yes")
+        self.assertTrue(helper.is_symlink())
+        with open(self.p(".local/share/shepherdr/installed.json")) as file:
+            backups = json.load(file)["backups"]
+        saved = Path(backups[0]) / ".local/bin/herdr-pi-chat"
+        helper.unlink()
+        helper.write_text("new personal helper")
+        run("uninstall", *root)
+        self.assertEqual(helper.read_text(), "new personal helper")
+        self.assertEqual(saved.read_text(), "old personal helper")
+
     def test_pi_extension_stays_in_canonical_scratch_root(self):
         with tempfile.TemporaryDirectory() as elsewhere:
             alias = os.path.join(elsewhere, "root-link")

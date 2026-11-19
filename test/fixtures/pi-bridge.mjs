@@ -58,7 +58,11 @@ await emit("session_start");
 console.log(process.pid);
 for await (const line of createInterface({ input: process.stdin })) {
   const { action, value } = JSON.parse(line);
-  if (action === "idle") idle = value;
+  if (action === "idle") {
+    idle = value;
+    await emit(idle ? "agent_settled" : "agent_start");
+  }
+  if (action === "run-ended") await emit("agent_end");
   if (action === "leaf" || action === "tree") leaf = value;
   if (action === "tree") await emit("session_tree");
   if (action === "tree-start") await emit("session_before_tree");
@@ -84,7 +88,10 @@ for await (const line of createInterface({ input: process.stdin })) {
   if (action === "compact") append(other("compact", "compaction", { summary: "what happened before compaction", firstKeptEntryId: leaf }));
   if (action === "branch-summary") append(other("branch-summary", "branch_summary", { summary: "why this branch exists" }));
   if (action === "stream") {
-    idle = false;
+    if (idle) {
+      idle = false;
+      await emit("agent_start");
+    }
     const event = live ? "message_update" : "message_start";
     live = message("provisional", "assistant", [{ type: "thinking", thinking: "live secret" }, text(value)]).message;
     await emit(event, { message: live });
