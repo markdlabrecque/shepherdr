@@ -606,14 +606,42 @@ export function claudeSwitch(text) {
   return null;
 }
 
-export function piConversation(items) {
+export function piConversation(items, { session, generation, state } = {}) {
   const conv = new Conversation("pi");
+  const prefix = generation ? `pi:${encodeURIComponent(session)}:${generation}:` : "";
+  const calls = new Map(), open = new Map();
+  const blocks = [];
   for (const x of items) {
     if (typeof x?.id !== "string" || typeof x.text !== "string") continue;
-    const at = typeof x.at === "number" ? x.at : Date.parse(x.at ?? "") || undefined;
-    if (x.role === "user") conv.user(x.id, { ...cleanUser(x.text), at });
-    else if (x.role === "assistant" || x.role === "error") conv.push({ kind: x.role === "error" ? "error" : "agent", id: x.id, text: x.text, at });
+    const tail = blocks.at(-1);
+    if (tail && tail.id === x.id && x.part !== undefined && tail.part + 1 === x.part) {
+      tail.text += x.text;
+      tail.part = x.part;
+    } else blocks.push(x.part === undefined ? x : { ...x });
   }
+  for (const x of blocks) {
+    const at = typeof x.at === "number" ? x.at : Date.parse(x.at ?? "") || undefined;
+    const id = prefix + x.id;
+    if (x.role === "user") { open.clear(); conv.user(id, { ...cleanUser(x.text), at }); }
+    else if (x.role === "assistant" || x.role === "error") {
+      if (x.text.trim()) conv.push({ kind: x.role === "error" ? "error" : "agent", id, at, text: x.text,
+        ...(x.provisional ? { provisional: true } : {}) });
+    } else if (x.role === "tool") {
+      const kind = { read: "read", edit: "edit", write: "edit", bash: "run", grep: "search", find: "search" };
+      const step = { id, kind: Object.hasOwn(kind, x.text) ? kind[x.text] : "tool", line: `Used ${x.text || "a tool"}` };
+      calls.set(x.id, step);
+      open.set(x.id, `Using ${x.text || "a tool"}`);
+      conv.push({ kind: "tools", id: `t:${id}`, at, steps: [step] });
+    } else if (x.role === "result") {
+      const step = calls.get(x.text);
+      if (step) step.out = x.text;
+      open.delete(x.text);
+    } else if (x.role === "compaction" || x.role === "branch" || x.role === "custom") {
+      const label = x.role === "compaction" ? "Compaction summary" : x.role === "branch" ? "Branch summary" : "Pi extension message";
+      if (x.text.trim()) conv.push({ kind: "brief", id, text: x.text, at, label });
+    }
+  }
+  if (state === "working") conv.doing = [...open.values()].at(-1) ?? null;
   return conv;
 }
 

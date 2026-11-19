@@ -26,9 +26,15 @@ class Scratch(unittest.TestCase):
         self.pid = os.getpid()
 
     def cli(self, op, fields=None, pid=None):
+        args = [CLIENT, op, str(self.pid if pid is None else pid)]
         if isinstance(fields, dict):
-            fields = json.dumps(fields).encode()
-        result = subprocess.run([CLIENT, op, str(self.pid if pid is None else pid)], input=fields or b"",
+            fields = json.dumps(fields)
+            if op == "send":
+                fields = fields.encode()
+            else:
+                args.append(fields)
+                fields = None
+        result = subprocess.run(args, input=fields or b"",
                                 env=self.env, capture_output=True, timeout=5)
         self.assertEqual(result.stderr, b"")
         self.assertEqual(result.stdout.count(b"\n"), 1)
@@ -138,7 +144,7 @@ class Bridge(Scratch):
 
     def fields(self, **changes):
         snap = self.cli("snapshot")
-        return {**{key: snap[key] for key in ("instance", "session", "leaf")},
+        return {**{key: snap[key] for key in ("instance", "session", "leaf", "generation") if key in snap},
                 "mode": "now", "id": "first", "body": "hello", **changes}
 
     def raw(self, frame):
@@ -153,15 +159,17 @@ class Bridge(Scratch):
         for path, mode in ((self.runtime, 0o700), (self.registry, 0o600), (self.address, 0o600)):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
         snap = self.cli("snapshot")
-        self.assertEqual(snap["items"], [{"id": "user-1", "role": "user", "text": "hello\nworld", "at": 1748779200123},
-                                         {"id": "assistant-1", "role": "assistant", "text": "reply!", "at": 1748779200123}])
+        self.assertEqual(snap["items"], [{"id": "user-1:0", "role": "user", "text": "hello\nworld", "at": 1748779200123},
+                                         {"id": "assistant-1:2", "role": "assistant", "text": "reply!", "at": 1748779200123}])
         self.assertEqual((snap["state"], snap["leaf"]), ("idle", "tool-1"))
         self.control("leaf", None)
         self.assertIsNone(self.cli("snapshot")["leaf"])
-        self.control("large")
-        items = self.cli("snapshot")["items"]
-        self.assertEqual([item["id"] for item in items], [f"msg-{i}" for i in range(25, 45)])
-        self.assertEqual({len(item["text"]) for item in items}, {1800})
+        self.control("wide")
+        snap = self.cli("snapshot")
+        items = snap["items"]
+        self.assertGreater(snap["before"], 0)
+        self.assertEqual(items[-1]["id"], "wide-44:0")
+        self.assertEqual({len(item["text"]) for item in items}, {3000})
         self.control("error")
         self.assertEqual(self.cli("snapshot")["state"], "error")
 
@@ -209,6 +217,109 @@ class Bridge(Scratch):
         self.assertEqual(self.control("reload"), [])
         self.assertEqual(self.cli("send", fields)["error"], "stale_instance")
         self.assertEqual(self.cli("send", self.fields())["status"], "accepted")
+
+    def cursor(self, snap):
+        return {key: snap[key] for key in ("generation", "leaf")}
+
+    def test_paged_branch_and_cursor_expiry(self):
+        self.control("large", 535)
+        snap = self.cli("snapshot")
+        self.assertEqual(len(snap["items"]), 20)
+        generation, before = snap["generation"], snap["before"]
+        self.control("advance", "next")
+        delta = self.cli("snapshot", self.cursor(snap))
+        self.assertFalse(delta["reset"])
+        self.assertEqual([x["text"] for x in delta["items"]], ["reply at next"])
+        all_items = snap["items"] + delta["items"]
+        while before:
+            page = self.cli("page", {"generation": generation, "before": before})
+            self.assertLess(page["before"], before)
+            before = page["before"]
+            all_items = page["items"] + all_items
+        self.assertEqual([item["text"] for item in all_items], [f"record {i}" for i in range(535)] + ["reply at next"])
+        self.control("wide")
+        self.assertTrue(self.cli("snapshot", self.cursor(delta))["reset"])
+        # A leaf change without any append must replace the window, not add a second branch.
+        self.control("leaf", "msg-10")
+        reset = self.cli("snapshot", self.cursor(delta))
+        self.assertTrue(reset["reset"])
+        self.assertNotEqual(reset["generation"], generation)
+        self.assertEqual([item["text"] for item in reset["items"]], [f"record {i}" for i in range(11)])
+        self.assertEqual(self.cli("page", {"generation": generation, "before": 3})["error"], "stale_revision")
+        self.control("root", "independent")
+        self.assertEqual([i["text"] for i in self.cli("snapshot", self.cursor(reset))["items"]], ["root independent"])
+        self.control("leaf", "msg-534")
+        self.assertEqual(self.cli("snapshot")["items"][-1]["text"], "record 534")
+
+    def test_a_long_text_block_can_span_multiple_bounded_pages(self):
+        self.control("long")
+        page = self.cli("snapshot")
+        self.assertGreater(page["before"], 0)
+        parts = page["items"]
+        generation = page["generation"]
+        while page["before"]:
+            page = self.cli("page", {"generation": generation, "before": page["before"]})
+            parts = page["items"] + parts
+        chunks = [p for p in parts if p["id"] == "long:0"]
+        self.assertEqual([p["part"] for p in chunks], list(range(len(chunks))))
+        self.assertEqual("".join(p["text"] for p in chunks), "x" * 7999 + "🌱" + "界" * 50_000)
+
+    def test_live_to_final_concurrent_tools_and_retry(self):
+        snap = self.cli("snapshot")
+        self.control("stream", "provisional words")
+        stream = self.cli("snapshot", self.cursor(snap))
+        self.assertEqual(stream["state"], "working")
+        self.assertEqual([i["text"] for i in stream["live"]], ["provisional words"])
+        self.control("stream", "more provisional words")
+        more = self.cli("snapshot", self.cursor(stream))
+        self.assertEqual(more["live"][0]["id"], stream["live"][0]["id"])
+        self.control("final", "authoritative final words")
+        settled = self.cli("snapshot", self.cursor(more))
+        self.assertEqual(settled["live"], [])
+        self.assertEqual([(i["id"], i["text"]) for i in settled["items"]], [("final:1", "authoritative final words")])
+        self.control("tool-calls")
+        tools = self.cli("snapshot", self.cursor(settled))
+        self.assertEqual([(i["id"], i["text"]) for i in tools["items"]], [("calls:0", "read"), ("calls:1", "extension_tool")])
+        query = {"generation": tools["generation"], "ids": ["calls:0", "calls:1"]}
+        self.assertEqual(self.cli("results", query)["outputs"], [])
+        self.control("tool-result", "b")
+        self.assertEqual(self.cli("results", query)["outputs"], [{"id": "calls:1", "text": "output-b"}])
+        self.control("tool-result", "a")
+        self.assertEqual(self.cli("results", query)["outputs"], [{"id": "calls:0", "text": "output-a"}, {"id": "calls:1", "text": "output-b"}])
+        self.assertNotIn("output-", json.dumps(self.cli("snapshot")))
+        self.control("error")
+        self.control("custom")
+        self.assertEqual(self.cli("snapshot")["state"], "working")
+        self.control("advance", "retry-succeeded")
+        self.control("compact")
+        self.assertEqual(self.cli("snapshot")["state"], "working")
+        self.control("idle", True)
+        self.assertEqual(self.cli("snapshot")["state"], "idle")
+        self.control("tree", "user-1")
+        self.assertEqual(self.cli("results", query)["error"], "stale_revision")
+
+    def test_custom_store_identity_partial_records_and_raw_compaction(self):
+        path = self.runtime.parent / "explicit store.jsonl"
+        self.control("file", str(path))
+        first = self.cli("snapshot")
+        self.control("partial")
+        partial = self.cli("snapshot", self.cursor(first))
+        self.assertFalse(partial["reset"])
+        self.assertEqual(partial["items"], [])
+        self.control("replace-file")
+        replaced = self.cli("snapshot", self.cursor(first))
+        self.assertTrue(replaced["reset"])
+        self.assertNotEqual(replaced["generation"], first["generation"])
+        self.control("truncate-file")
+        self.assertNotEqual(self.cli("snapshot")["generation"], replaced["generation"])
+        self.control("custom")
+        self.control("compact")
+        self.control("branch-summary")
+        items = self.cli("snapshot")["items"]
+        self.assertEqual([(x["role"], x["text"]) for x in items], [
+            ("user", "hello\nworld"), ("assistant", "reply!"), ("custom", "visible extension note"),
+            ("compaction", "what happened before compaction"), ("branch", "why this branch exists"),
+        ])
 
     def test_wire_bounds_pid_and_shutdown(self):
         instance = self.cli("snapshot")["instance"]

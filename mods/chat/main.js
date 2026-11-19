@@ -1254,9 +1254,22 @@ export default class Chat extends View {
     if (this.kind === "pi" && this.piReader?.addr === this.addr) {
       const reader = this.piReader;
       if (!await reader.pull() || this.piReader !== reader || this.addr !== reader.addr) return;
+      if (this.piView !== reader.piView) {
+        this.piView = reader.piView;
+        this.opened.clear();
+        this.results.clear();
+        this.loadingEarlier = false;
+        this.piEarlier = null;
+        this.anchor = null;
+        this.pinned = this.stick = true;
+      }
       this.conv = reader.conv;
+      this.start = reader.start;
       this.settlePending();
       this.phase = reader.pi ? "ready" : "pi-unavailable";
+      for (const row of this.conv?.items ?? []) {
+        if (row.kind === "tools" && this.opened.has(row.id)) this.loadResults(row, cx);
+      }
       cx.notify();
       return;
     }
@@ -1308,26 +1321,35 @@ export default class Chat extends View {
   // The page before what is shown, when the person reaches the top. The row that was first
   // stays where it was: the list is scrolled back to it once the new rows are in.
   loadEarlier(cx) {
-    if (this.loadingEarlier || !this.start || !this.path) return;
+    const reader = this.kind === "pi" ? this.piReader : null;
+    if (this.loadingEarlier || !this.start || (!this.path && !reader)) return;
     this.loadingEarlier = true;
-    const path = this.path, before = this.start;
+    const path = this.path, before = this.start, view = reader?.piView;
+    const request = reader ? (this.piEarlier = {}) : null;
     const rows = this.rows();
     const first = rows[Math.min(rows.length - 1, Math.max(1, this.range?.start ?? 1))]?.id;
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const r = await this.log(["page", path, String(before), String(PAGE)]);
-        const { head, records: recs } = records(r.stdout);
-        if (path !== this.path || this.start !== before || head[0] !== "P") return;
-        this.start = Number(head[1]);
-        this.records = [...recs, ...this.records];
-        this.rebuild();
+        if (reader) {
+          if (!await reader.earlier(view) || this.piReader !== reader || this.piView !== view || this.addr !== reader.addr) return;
+          this.start = reader.start;
+          this.conv = reader.conv;
+          this.settlePending();
+        } else {
+          const r = await this.log(["page", path, String(before), String(PAGE)]);
+          const { head, records: recs } = records(r.stdout);
+          if (path !== this.path || this.start !== before || head[0] !== "P") return;
+          this.start = Number(head[1]);
+          this.records = [...recs, ...this.records];
+          this.rebuild();
+        }
         this.anchor = first ? { id: first, until: Date.now() + 3000 } : null;
         this.reanchor = true;
       } catch (e) {
         this.error = String(e?.message ?? e);
       } finally {
-        this.loadingEarlier = false;
+        if (!request || this.piEarlier === request) this.loadingEarlier = false;
         cx.notify();
       }
     });
@@ -1336,13 +1358,24 @@ export default class Chat extends View {
   // An opened tools row shows each call's output, read from the log only now.
   loadResults(row, cx) {
     const want = row.steps.filter((s) => s.out !== undefined && !this.results.has(s.id));
-    if (!want.length || !this.path) return;
+    const reader = this.kind === "pi" ? this.piReader : null;
+    if (!want.length || (!this.path && !reader)) return;
     for (const s of want) this.results.set(s.id, null);
     for (const k of this.results.keys()) { if (this.results.size <= KEEP) break; this.results.delete(k); }
     const offs = [...new Set(want.map((s) => s.out))].slice(0, 40);
     const path = this.path;
+    const view = reader?.piView;
     cx.spawn(async (cx) => {
       try {
+        if (reader) {
+          const contents = await reader.results(want);
+          if (this.piReader !== reader || this.piView !== view || this.addr !== reader.addr) return;
+          for (const s of want) {
+            if (contents.has(s.id)) this.results.set(s.id, contents.get(s.id));
+            else this.results.delete(s.id);
+          }
+          return;
+        }
         const r = await this.log(["results", path, ...offs.map(String)]);
         for (const part of r.stdout.split("\x1e").slice(1)) {
           const nl = part.indexOf("\n");
@@ -1350,8 +1383,7 @@ export default class Chat extends View {
           const line = part.slice(nl + 1).replace(/\n$/, "");
           for (const s of want) if (s.out === off) this.results.set(s.id, resultText(line, s.id) ?? "");
         }
-      } catch {}
-      cx.notify();
+      } catch {} finally { cx.notify(); }
     });
   }
 
@@ -3108,7 +3140,7 @@ export default class Chat extends View {
       if (x.kind === "agent") {
         // The pictures and videos it named in its words (core/chat-view.js mediaIn, as the web app's chat): the
         // pictures under its words as the person's are, each video a line that opens it (the window can't play one).
-        const md = mediaIn(x.text, { cwd: this.t?.foreground?.cwd ?? this.t?.cwd ?? null, home: this.machine ? null : home() });
+        const md = x.provisional ? { text: x.text, media: [] } : mediaIn(x.text, { cwd: this.t?.foreground?.cwd ?? this.t?.cwd ?? null, home: this.machine ? null : home() });
         const ps = md.text || !md.media.length ? parts(md.text || x.text) : [];
         const first = out.length;
         // A long reply: its first lines (the part where they end cut off there), then Show more.
@@ -3132,7 +3164,7 @@ export default class Chat extends View {
         // Every message of the agent's gets its own actions and reactions, also while it works;
         // only the one it may still be writing (the newest, while working) waits. The actions go
         // under its last row.
-        if (!(working && i === items.length - 1) && out.length > first) {
+        if (!x.provisional && !(working && i === items.length - 1) && out.length > first) {
           const bar = { id: `b:${x.id}`, of: x.id, target: x.text, text: x.text, side: "agent", at: x.at, pills: this.pills(x.id),
             acts: bandActs("agent", x.text, { fork: Boolean(this.kind) && this.kind !== "pi" }) };
           out[out.length - 1] = { ...out[out.length - 1], bar };

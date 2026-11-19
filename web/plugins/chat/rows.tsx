@@ -318,22 +318,29 @@ if (typeof addEventListener === 'function') {
 export function HeadRow({ chat }: { chat: Chat }) {
   const ref = useRef<HTMLDivElement>(null)
   // scrolled up to it: the page before loads (as the window's loadEarlier), once per page
-  const asked = useRef(0)
-  const count = chat.messages.length
+  const asked = useRef<string | null>(null)
+  const cursor = `${chat.piView ?? ''}:${chat.piBefore ?? chat.messages.length}`
+  const load = () => {
+    if (asked.current === cursor) return
+    asked.current = cursor
+    void act({ type: 'earlier', chat: chat.key, view: chat.piView } as never).catch(() => undefined).finally(() => {
+      if (asked.current === cursor) asked.current = null
+    })
+  }
   useEffect(() => {
     const el = ref.current
     if (!el || !chat.earlier) return
     const io = new IntersectionObserver(([e]) => {
       // only while the person scrolls up (the window's wheel): a page loaded in its place doesn't load the next
-      if (!e?.isIntersecting || asked.current === count || Date.now() - scrolledUp > 1500) return
-      asked.current = count
-      void act({ type: 'earlier', chat: chat.key } as never).catch(() => undefined)
+      if (e?.isIntersecting && Date.now() - scrolledUp <= 1500) load()
     })
     io.observe(el)
     return () => io.disconnect()
-  }, [chat.earlier, chat.key, count])
+  }, [chat.earlier, chat.key, cursor])
   if (!chat.top && !chat.earlier) return null
-  return <div ref={ref} data-head={chat.top ? 'top' : 'earlier'} className="w-full py-[7px] text-center text-[0.75rem] text-fg3 phone:text-[0.8125rem]">{chat.top ? WORDS.top : WORDS.loading}</div>
+  return <div ref={ref} data-head={chat.top ? 'top' : 'earlier'} className="w-full py-[7px] text-center text-[0.75rem] text-fg3 phone:text-[0.8125rem]">
+    {chat.top ? WORDS.top : chat.piView ? <button type="button" onClick={load} className="hover:text-fg">Load earlier messages</button> : WORDS.loading}
+  </div>
 }
 
 /* ---------- images under a message ---------- */

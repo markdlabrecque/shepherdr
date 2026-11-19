@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { act } from "./actions.ts";
 import { Chats } from "./chats.ts";
-import { Compat } from "./compat.ts";
+import { activity, Compat } from "./compat.ts";
 import type { Hub } from "./hub.ts";
 import { failedOf, forgetAll } from "./send-once.ts";
 import { PI_BLOCKED, PI_UNAVAILABLE, PI_UNCONFIRMED } from "../core/pi-chat.js";
@@ -24,7 +24,7 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-function remote(read: () => unknown = () => snap, send: (request: any) => unknown = () => ({ ok: true, status: "accepted" })) {
+function remote(read: (op: string, query: any) => unknown = () => snap, send: (request: any) => unknown = () => ({ ok: true, status: "accepted" })) {
   const calls: any[] = [];
   const requests: any[] = [];
   const h = {
@@ -33,9 +33,11 @@ function remote(read: () => unknown = () => snap, send: (request: any) => unknow
     async core() { throw new Error("no watch stream in this test"); },
     async call(method: string, p: any) {
       calls.push({ method, ...p });
-      const op = p.argv.at(-2);
-      if (op === "snapshot") return out(read());
-      if (op !== "send") throw new Error(`Unexpected call: ${method} ${op}`);
+      const op = p.argv[4];
+      if (op !== "send") {
+        const result: any = await read(op, p.argv[6] && JSON.parse(p.argv[6]));
+        return out(result, result?.ok ? 0 : 1);
+      }
       const request = JSON.parse(Buffer.from(p.input, "base64").toString("utf8"));
       requests.push(request);
       const result: any = send(request);
@@ -84,6 +86,63 @@ test("read and send Pi chat on the qualified machine, with text only on stdin", 
     chats.unwatch(addr, page);
     if (previous.hc === undefined) delete process.env.SHEPHERDR_HC; else process.env.SHEPHERDR_HC = previous.hc;
   }
+});
+
+test("web publishes Pi append, earlier, branch replacement and a revalidated reconnect", async () => {
+  const key = `t:${addr}`;
+  const row = (id: string, text: string, role = "assistant") => ({ id, role, text, at: 1748779200456 });
+  const shape = { ...snap, generation: "g1", reset: true, before: 1, live: [] as ReturnType<typeof row>[], items: [row("call:0", "read", "tool")] };
+  const queried: any[] = [];
+  let getSnapshot = (_query?: any) => shape;
+  let finishResult: ((value: unknown) => void) | undefined;
+  const { h } = remote((op, query) => {
+    queried.push([op, query]);
+    if (op === "snapshot") return getSnapshot(query);
+    if (op === "page") return { ...shape, before: 0, items: [row("first:0", "older text", "user")] };
+    if (op === "results") return new Promise((resolve) => { finishResult = resolve; });
+  });
+  const chats = new Chats(h);
+  const compat = new Compat();
+  const published: ReturnType<Compat["chat"]>[] = [];
+  const page = (r: any, t: any) => published.push(compat.chat(key, r, t));
+  const latest = () => published.at(-1)!;
+  chats.watch(addr, page);
+  try {
+    await until(() => published.length);
+    const view = latest().piView!;
+    expect(latest().earlier).toBeTrue();
+    expect(latest().messages[0].activity?.resultReady).toBeFalse();
+    expect(queried.map(([op]) => op)).toEqual(["snapshot"]);
+    await chats.earlier(addr, view);
+    expect(latest().top).toBeTrue();
+    expect(latest().messages[0].text).toBe("older text");
+    getSnapshot = (query) => ({ ...shape, before: query?.leaf === "new-result" ? 3 : 2, reset: false, leaf: "new-result", state: "working",
+      live: [row("live:1:0", "Pi streaming")], items: query?.leaf === "new-result" ? [] : [row("result:0", "call:0", "result")] });
+    await until(() => latest().messages.some((m) => m.provisional));
+    const tool = latest().messages.find((m) => m.activity)!.activity!;
+    expect(tool.resultReady).toBeTrue();
+    expect(latest().piView).toBe(view);
+    expect(latest().messages[0].text).toBe("older text");
+    const details = activity(chats.reader(addr), tool.id, view);
+    await until(() => finishResult);
+    getSnapshot = () => ({ ...shape, generation: "other", leaf: "fork", before: 0,
+      items: [row("fork:0", "fork only"), row("notice:0", "retained history", "compaction")] });
+    await until(() => latest().piView !== view);
+    finishResult?.({ ...shape, outputs: [{ id: "call:0", text: "out from old branch" }] });
+    expect(await details).toHaveProperty("error");
+    expect(latest().messages.map((m) => m.text)).toEqual(["fork only", "retained history"]);
+    expect(latest().messages[1].brief?.label).toBe("Compaction summary");
+    await chats.earlier(addr, view);
+    expect(queried.filter(([op]) => op === "page")).toHaveLength(1);
+    chats.unwatch(addr, page);
+    const before = published.length;
+    getSnapshot = () => ({ ...shape, generation: "after-reconnect", leaf: "root", before: 0, items: [row("root:0", "reconnected only")] });
+    chats.watch(addr, page);
+    expect(published).toHaveLength(before);
+    await until(() => published.length > before);
+    expect(latest().messages.map((m) => m.text)).toEqual(["reconnected only"]);
+    expect(queried.at(-1)).toEqual(["snapshot", undefined]);
+  } finally { chats.unwatch(addr, page); }
 });
 
 test("held Pi send keeps its identity across polls and is not retried after a lost receipt", async () => {

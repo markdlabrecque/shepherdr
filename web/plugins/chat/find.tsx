@@ -43,6 +43,7 @@ export function FindBar({ chatKey }: { chatKey: string }) {
   const f = useUI((u) => (u.find?.chat === chatKey ? u.find : null))
   const msgs = useStore((s) => s.chats[chatKey]?.messages)
   const earlier = useStore((s) => !!s.chats[chatKey]?.earlier)
+  const view = useStore((s) => s.chats[chatKey]?.piView)
   const [loading, setLoading] = useState(false)
   const input = useRef<HTMLInputElement>(null)
   const q = f?.q ?? ''
@@ -103,7 +104,7 @@ export function FindBar({ chatKey }: { chatKey: string }) {
         ) : null}
         {/* the log's earlier pages, not loaded yet: the window's Search earlier */}
         {earlier ? (
-          <button type="button" disabled={loading} onClick={() => { setLoading(true); void act({ type: 'earlier', chat: chatKey } as never).finally(() => setLoading(false)) }}
+          <button type="button" disabled={loading} onClick={() => { setLoading(true); void act({ type: 'earlier', chat: chatKey, view } as never).finally(() => setLoading(false)) }}
             className="h-[26px] shrink-0 rounded-[6px] px-2 text-[0.75rem] text-fg2 hover:bg-hover hover:text-fg phone:h-9 phone:text-[0.8125rem]">
             {loading ? 'Loading…' : WORDS.searchEarlier}
           </button>

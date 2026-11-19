@@ -75,7 +75,7 @@ async function sendNow(hub: Hub, b: any, compat: Compat, again = false) {
     const target = piTarget(pid, snapshot);
     if (!target) throw sendError(PI_UNAVAILABLE, true);
     const cid = typeof b.cid === "string" && b.cid ? b.cid.slice(0, 80) : piRequestId();
-    const note = () => { const at = Date.now(); compat.noteSend?.(a, { cid, text, files: sent, at }); return at; };
+    const note = () => { const at = Date.now(); compat.noteSend?.(a, { cid, text, files: sent, at, piGeneration: target.generation }); return at; };
     const deliver = async (mode: string) => {
       const current = await withForeground(a, hub.terminals.get(a));
       if (current?.state !== "live" || kindOf(current) !== "pi" || current.foreground?.pid !== pid)
@@ -585,7 +585,7 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
   }
   if (b?.type === "earlier" && typeof b.chat === "string") {
     // the chat scrolled to its top ("Loading earlier…"): the log's page before what it shows
-    await (compat as any).earlier?.(chat(b.chat));
+    await (compat as any).earlier?.(chat(b.chat), typeof b.view === "string" ? b.view : undefined);
     return { ok: true };
   }
   if (b?.type === "fork" && typeof b.chat === "string") {

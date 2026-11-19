@@ -22,20 +22,31 @@ const refusals = {
 export const piMachine = (addr) => addr.includes("/") ? addr.split("/")[0] : null;
 export const piRequestId = () => `shep-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-export async function piSnapshot(sh, addr, pid) {
+async function piRead(sh, addr, pid, op, query) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   try {
-    const r = await sh(PI_CLIENT, ["pi-chat", "snapshot", String(pid)], piMachine(addr));
+    const args = ["pi-chat", op, String(pid)];
+    if (query) args.push(JSON.stringify(query));
+    const r = await sh(PI_CLIENT, args, piMachine(addr));
     const s = JSON.parse(r.stdout);
-    if (r.code === 0 && s?.ok && typeof s.instance === "string" && typeof s.session === "string" &&
-        ["idle", "working", "blocked", "error"].includes(s.state) && Array.isArray(s.items)) return s;
+    if (s?.error === "stale_revision") return s;
+    if (r.code === 0 && s?.ok && typeof s.instance === "string" && typeof s.session === "string") return s;
   } catch {}
   return null;
 }
 
+export async function piSnapshot(sh, addr, pid, cursor) {
+  const s = await piRead(sh, addr, pid, "snapshot", cursor?.generation ? { generation: cursor.generation, leaf: cursor.leaf } : null);
+  return s && ["idle", "working", "blocked", "error"].includes(s.state) && Array.isArray(s.items) ? s : null;
+}
+export const piPage = (sh, addr, pid, generation, before) => piRead(sh, addr, pid, "page", { generation, before });
+export const piResults = (sh, addr, pid, generation, ids) => piRead(sh, addr, pid, "results", { generation, ids });
+export const samePiHistory = (a, b) => a && b && a.instance === b.instance && a.session === b.session && a.generation === b.generation;
+
 // Capture this at composition time. Never deliver a queued or retried message to a replacement process/session.
 export function piTarget(pid, snapshot) {
-  return snapshot ? { pid, instance: snapshot.instance, session: snapshot.session, leaf: snapshot.leaf } : null;
+  return snapshot ? { pid, instance: snapshot.instance, session: snapshot.session, leaf: snapshot.leaf,
+    ...(snapshot.generation ? { generation: snapshot.generation } : {}) } : null;
 }
 
 export async function piSend(run, addr, target, id, body, mode = "now") {

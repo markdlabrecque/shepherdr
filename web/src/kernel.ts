@@ -839,6 +839,12 @@ export function connect() {
 function drop(sock: WebSocket) {
   if (sock !== ws) return
   forget()
+  // Pi may change its active leaf while this tab is offline. Wait for the newly watched snapshot.
+  const chats = Object.entries(state.chats).filter(([, chat]) => chat.cli !== 'pi')
+  if (chats.length !== Object.keys(state.chats).length) {
+    state = { ...state, chats: Object.fromEntries(chats) }
+    emit()
+  }
   downSince ??= Date.now()
   saying ??= sayLater()
   retrying = setTimeout(connect, retryIn(tries++))

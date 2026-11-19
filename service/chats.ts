@@ -66,6 +66,11 @@ export class Chats {
   watch(addr: string, page: Watcher) {
     let f = this.followed.get(addr);
     if (!f) this.followed.set(addr, (f = { reader: readerFor(this.io, addr), pages: new Set(), busy: false, idleSince: null, ready: false }));
+    if (f.reader.kind === "pi") {
+      // Revalidate before sending anything to a returning page. With nobody watching, discard the old cursor.
+      if (!f.pages.size) f.reader.refreshPi();
+      f.ready = false;
+    }
     f.pages.add(page);
     f.idleSince = null;
     if (f.ready) page(f.reader, this.hub.terminals.get(addr));
@@ -88,9 +93,9 @@ export class Chats {
   /** The reader of a chat someone follows now, else null. */
   reader(addr: string) { return this.followed.get(addr)?.reader ?? null; }
 
-  async earlier(addr: string) {
+  async earlier(addr: string, view?: string) {
     const f = this.followed.get(addr);
-    if (f && (await f.reader.earlier())) this.publish(addr, f);
+    if (f && (await f.reader.earlier(view)) && this.followed.get(addr) === f) this.publish(addr, f);
   }
 
   /** Its terminal drew something: read its log soon (at once, else NUDGE after the last read). */
@@ -156,6 +161,7 @@ export class Chats {
   }
 
   private publish(addr: string, f: Followed) {
+    if (f.reader.kind === "pi" && f.reader.piFresh && f.reader.state !== "unavailable") return;
     f.ready = true;
     const t = this.hub.terminals.get(addr);
     for (const page of f.pages) page(f.reader, t);

@@ -560,6 +560,8 @@ export interface Message {
   suggest?: string
   /** a live row: when it last changed; at keeps its place in the chat */
   updated?: number
+  /** Pi is still streaming this text. It has no persisted message actions yet. */
+  provisional?: boolean
   /** plain text (yours) or markdown (the agent's) */
   text?: string
   /** "Answered “Rerun CI on main?”" */
@@ -710,6 +712,8 @@ export interface TurnActivity {
   failed?: number
   /** 3.0's tools row, closed: "Read 3 files, ran 2 commands" (core/chat-log.js summary) */
   summary?: string
+  /** A Pi tool result is ready to fetch when the row opens. */
+  resultReady?: boolean
 }
 
 /** Work an agent started in the background that still runs */
@@ -862,6 +866,10 @@ export interface Chat {
    *  as the chat scrolls up ("Loading earlier…") */
   top?: boolean
   earlier?: boolean
+  /** Changes when Pi history is replaced, so old page and tool requests cannot affect this view. */
+  piView?: string
+  /** Pi's oldest loaded position, which can change without adding a visible row. */
+  piBefore?: number
   /** 3.0's working line over the box: what it does now (empty: "Working"); waits: only waiting (a clock, no spinner) */
   doing?: string
   waits?: boolean

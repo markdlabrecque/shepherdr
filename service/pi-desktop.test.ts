@@ -21,7 +21,7 @@ test("the window pulls a qualified Pi snapshot and uses its status, not the term
   const reader = new ChatReader({ sh: async (...args: unknown[]) => { calls.push(args); return answer; } }, addr);
   await reader.locate({ state: "live", foreground: { name: "pi", pid: 77 } });
   const changed: number[] = [];
-  const self = { addr, kind: "pi", piReader: reader, conv: null as any, phase: "finding", settlePending() {} };
+  const self = { addr, kind: "pi", piReader: reader, conv: null as any, phase: "finding", results: new Map(), opened: new Set(), settlePending() {} };
   const pull = method("pull", { PI_UNAVAILABLE });
   await pull.call(self, { notify: () => changed.push(1) });
   expect(calls[0].slice(1)).toEqual([["pi-chat", "snapshot", "77"], "desktop-remote"]);
@@ -33,6 +33,46 @@ test("the window pulls a qualified Pi snapshot and uses its status, not the term
   await pull.call(self, { notify: () => changed.push(1) });
   expect(self.phase).toBe("pi-unavailable");
   expect(changed).toHaveLength(2);
+});
+
+test("desktop paging keeps its anchor and drops a tool response from the previous Pi branch", async () => {
+  const root = { ...snapshot, generation: "original", reset: true, before: 2, live: [] };
+  const tool = { id: "call:0", role: "tool", text: "read", at: 1234 };
+  const result = { id: "result:0", role: "result", text: "call:0", at: 1235 };
+  let answer = { ...root, items: [tool, result] };
+  let deliverResult: ((r: ReturnType<typeof json>) => void) | undefined;
+  const reader = new ChatReader({ sh: async (_: string, args: string[]) => {
+    if (args[1] === "results") return new Promise((resolve) => { deliverResult = resolve; });
+    if (args[1] === "page") return json({ ...root, before: 0, items: [{ id: "old:0", role: "user", text: "older", at: 1000 }] });
+    return json(answer);
+  } }, addr);
+  await reader.locate({ state: "live", foreground: { name: "pi", pid: 77 } });
+  const jobs: Promise<unknown>[] = [];
+  const cx = { notify() {}, spawn: (fn: Function) => jobs.push(fn(cx)) };
+  const self: any = { addr, kind: "pi", piReader: reader, results: new Map(), opened: new Set(),
+    rows: () => [{ id: "top" }, ...reader.conv!.items],
+    settlePending() {}, loadResults: method("loadResults", { KEEP: 2000 }) };
+  const pull = method("pull");
+  await pull.call(self, cx);
+  const row = self.conv.items[0];
+  method("loadEarlier").call(self, cx);
+  await jobs.pop();
+  expect(self.anchor.id).toBe(row.id);
+  expect(self.start).toBe(0);
+  expect(self.conv.items[0].text).toBe("older");
+  self.opened.add(row.id);
+  self.loadResults(row, cx);
+  const oldTool = jobs.pop();
+  expect(deliverResult).toBeDefined();
+  answer = { ...root, generation: "fork", leaf: "other", before: 0,
+    items: [{ id: "other:0", role: "assistant", text: "new branch", at: 1240 }] };
+  await pull.call(self, cx);
+  deliverResult?.(json({ ...root, outputs: [{ id: "call:0", text: "previous branch's output" }] }));
+  await oldTool;
+  expect(self.conv.items.map((i: any) => i.text)).toEqual(["new branch"]);
+  expect(self.results.size).toBe(0);
+  expect(self.opened.size).toBe(0);
+  expect(self.anchor).toBeNull();
 });
 
 test("desktop held sends keep the old leaf; Send now steers and an unconfirmed send has no Retry", async () => {

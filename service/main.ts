@@ -136,7 +136,7 @@ live.chats = new Chats(hub);
 live.compat = compat;
 compat.reader = (a) => live.chats?.reader(a) ?? null;
 // the chat scrolled to its top: the page before (as the window's loadEarlier)
-(compat as any).earlier = (a: string) => live.chats?.earlier(a);
+(compat as any).earlier = (a: string, view?: string) => live.chats?.earlier(a, view);
 const push = new Push(() => (me ? webOrigin(me.dns, hp) : "https://herdr.dev"));
 // only the machine that serves the web app sends push alerts (its pages subscribed there): never two of one alert
 const pushSend = push.send.bind(push);
@@ -905,7 +905,7 @@ const server = Bun.serve<{ who: string }>({
         const out = id.startsWith("b:") && r ? await r.jobOutput(id.slice(2)).catch(() => null) : null;
         return json(out === null ? { error: "It isn't running any more." } : { output: out });
       }
-      return json(await activity(r, id));
+      return json(await activity(r, id, url.searchParams.get("view") ?? undefined));
     }
     if (path === "/api/action" && req.method === "POST") return doAction(await req.json().catch(() => null));
     if (path === "/api/glance" && req.method === "GET") {

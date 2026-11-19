@@ -5,7 +5,7 @@ import clsx from 'clsx'
 import * as SL from '@core/slash.js'
 const { typing: slashTyping, match: slashMatch } = SL as any
 import { openAccept } from '@client/screens/Accept.tsx'
-import { createContext, Fragment, memo, useContext, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ComponentType, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type RefObject } from 'react'
+import { Component, createContext, Fragment, memo, useContext, useEffect, useLayoutEffect, useRef, useState, type ChangeEvent, type ComponentType, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode, type RefObject } from 'react'
 import { act, chatName, definePlugin, getDraft, getState, goChat, has, holdReload, openArtifact, openItem, openNeeds, openTask, registry, setDraft, setOutbox, setUI, taskOf, useDraft, useSnap, useStore, useUI, type UI } from '@client/kernel.ts'
 import { anchorOf, keyOf, partsOf, placesOf, priorOf, reasonOf, SEND_TIMEOUT, unconfirmedPi, type Outgoing } from '@client/outbox.ts'
 import { dropFiles, keepFile, keptFile, postFile, retrying, sweepFiles, transient, HttpError } from '@client/uploads.ts'
@@ -1213,7 +1213,7 @@ const Messages = memo(function Messages({ chat, from }: { chat: Chat; from: stri
   type Item = { at: number; msg: Message; out?: Outgoing; last?: boolean } | { at: number; album: Message[]; out?: Outgoing; last?: boolean }
   // held messages aren't in the conversation yet: they are rows over the box (Held), as the window's
   const shown: Item[] = chat.messages.filter((m) => !isHeld(m)).map((msg) => ({ at: msg.at ?? 0, msg }))
-  shown.sort((a, b) => a.at - b.at)
+  if (chat.cli !== 'pi') shown.sort((a, b) => a.at - b.at)
   // what you just sent, in one list with the rest: right after what was last when you sent it, so newer messages come
   // under it and the chat keeps the order things were sent in (SHEP-93: one stuck at the bottom under everything
   // newer). When it comes back it keeps its place in the list, so nothing is drawn again (a picture doesn't load twice)
@@ -1305,7 +1305,7 @@ const Messages = memo(function Messages({ chat, from }: { chat: Chat; from: stri
                 <div data-quiet className="flex w-full flex-col">
                   {it.quiet.map((m) => (
                     <div key={m.id} data-msg={m.id} data-chat={chat.key} className="w-full">
-                      {m.activity ? <TurnLine a={m.activity} chat={chat.key} /> : m.brief ? <BriefRow msg={m} /> : m.news ? <NewsRow msg={m} /> : m.ended ? <EndedRow msg={m} /> : m.pilot ? <PilotRow msg={m} /> : <PublishingRow />}
+                      {m.activity ? <TurnLine a={m.activity} chat={chat.key} view={chat.piView} /> : m.brief ? <BriefRow msg={m} /> : m.news ? <NewsRow msg={m} /> : m.ended ? <EndedRow msg={m} /> : m.pilot ? <PilotRow msg={m} /> : <PublishingRow />}
                     </div>
                   ))}
                 </div>
@@ -1318,7 +1318,7 @@ const Messages = memo(function Messages({ chat, from }: { chat: Chat; from: stri
               ) : it.msg.images ? (
                 <ImagesLine n={it.msg.images} />
               ) : (
-                <Bubble msg={it.msg} chat={chat} from={from} out={it.out} last={it.last} pics={pics.get(it.msg)} images={imgLines.get(it.msg)} writing={writing === it.msg.id} />
+                <Bubble msg={it.msg} chat={chat} from={from} out={it.out} last={it.last} pics={pics.get(it.msg)} images={imgLines.get(it.msg)} writing={it.msg.provisional || writing === it.msg.id} />
               )}
             </Row>
           </Fragment>
@@ -2719,7 +2719,31 @@ function scrollKept(chatKey: string): number | null {
   }
 }
 
-function StickToBottom({ chatKey, children }: { chatKey: string; children: ReactNode }) {
+type PiAnchor = { id: string; offset: number }
+type PiAnchorProps = { box: RefObject<HTMLDivElement | null>; before?: number; children: ReactNode }
+
+// Pi can prepend a page while this tab reads farther up. The head row also changes, so do not let the browser
+// anchor to that row. Measure an actual message before React updates the DOM, including pages another tab asked for.
+class KeepPiAnchor extends Component<PiAnchorProps> {
+  getSnapshotBeforeUpdate(previous: PiAnchorProps): PiAnchor | null {
+    const { box, before } = this.props
+    const el = box.current
+    if (before === undefined || previous.before === undefined || before >= previous.before || !el) return null
+    const top = el.getBoundingClientRect().top
+    const rows = el.querySelectorAll<HTMLElement>('[data-msg]')
+    const row = Array.from(rows).find((r) => r.getBoundingClientRect().bottom > top)
+    return row?.dataset.msg ? { id: row.dataset.msg, offset: row.getBoundingClientRect().top - top } : null
+  }
+  componentDidUpdate(_previous: PiAnchorProps, _state: unknown, anchor: PiAnchor | null) {
+    const el = this.props.box.current
+    if (!anchor || !el) return
+    const row = el.querySelector(`[data-msg="${CSS.escape(anchor.id)}"]`)
+    if (row) el.scrollTop += row.getBoundingClientRect().top - el.getBoundingClientRect().top - anchor.offset
+  }
+  render() { return this.props.children }
+}
+
+function StickToBottom({ chatKey, piBefore, children }: { chatKey: string; piBefore?: number; children: ReactNode }) {
   const box = useRef<HTMLDivElement>(null)
   const inner = useRef<HTMLDivElement>(null)
   const pinned = useRef(true)
@@ -2731,7 +2755,7 @@ function StickToBottom({ chatKey, children }: { chatKey: string; children: React
   const questionIds = useStore((s) => (s.chats[chatKey]?.messages ?? []).filter((m) => (m.question && m.question.sent === undefined && !m.question.closed) || (m.secret && !m.secret.saved)).map((m) => m.id).join('\n'))
   const questions = questionIds ? questionIds.split('\n').map((id) => ({ id })) : []
   // the agent's messages, and how many of them you had seen at the bottom
-  const replies = useStore((s) => (s.chats[chatKey]?.messages ?? []).filter((m) => m.who === 'agent' && !m.waiting).map((m) => m.id).join('\n'))
+  const replies = useStore((s) => (s.chats[chatKey]?.messages ?? []).filter((m) => m.who === 'agent' && !m.waiting && !m.provisional).map((m) => m.id).join('\n'))
   const ids = replies ? replies.split('\n') : []
   /** the replies you had in view at the bottom: the others came in while you read further up */
   const read = useRef<Set<string> | null>(null)
@@ -2876,7 +2900,7 @@ function StickToBottom({ chatKey, children }: { chatKey: string; children: React
         className="flex min-h-0 flex-1 touch-pan-y touch-pinch-zoom flex-col overflow-x-hidden overflow-y-auto overscroll-contain"
       >
         <div ref={inner} data-kb className="flex flex-1 flex-col">
-          <NewAt.Provider value={newAt}>{children}</NewAt.Provider>
+          <NewAt.Provider value={newAt}><KeepPiAnchor box={box} before={piBefore}>{children}</KeepPiAnchor></NewAt.Provider>
         </div>
       </div>
       {/* read further up, the chat fades out at the bottom, so the arrow sits on the fade, not on crisp words (like
@@ -2944,7 +2968,7 @@ function ChatView({ chatKey, placeholder, unreachable }: { chatKey: string; plac
   return (
     <DropFiles chatKey={chatKey}>
       <FindBar chatKey={chatKey} />
-      <StickToBottom key={chatKey} chatKey={chatKey}>
+      <StickToBottom key={chat?.piView ? `${chatKey}:${chat.piView}` : chatKey} chatKey={chatKey} piBefore={chat?.piBefore}>
         {unreachable ? (
           <div className="mx-auto w-full max-w-read px-5 pt-4">
             <div role="status" className="rounded-box bg-bubble px-3 py-2.5 text-[0.8125rem] text-pretty text-fg2 phone:text-[0.9375rem]">

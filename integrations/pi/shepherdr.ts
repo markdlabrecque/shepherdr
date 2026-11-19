@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { stripVTControlCharacters, TextDecoder } from "node:util";
@@ -42,43 +42,151 @@ function unlink(path: string) {
   catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
 }
 
-function cleanText(value: string) {
-  return stripVTControlCharacters(value.slice(0, 3600))
+const PAGE_ROWS = 20;
+const PAGE_BYTES = 80 * 1024;
+const LIVE_BYTES = 32 * 1024;
+const RESULT_LIMIT = 10;
+const TEXT_CHUNK = 8000;
+
+function cleanText(value: string, limit = value.length) {
+  const text = stripVTControlCharacters(value.slice(0, limit))
     .replace(/\r\n?/g, "\n")
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "");
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "")
+    .replace(/[\ud800-\udfff]/gu, "\ufffd");
+  return value.length > limit ? `${text}\n… (truncated)` : text;
 }
 
-function transcript(ctx: ExtensionContext) {
-  const branch = ctx.sessionManager.getBranch();
-  const items: { id: string; role: "user" | "assistant"; text: string; at: number }[] = [];
-  let failed: boolean | undefined;
-  for (let i = branch.length - 1; i >= 0 && i >= branch.length - 512 && items.length < 20; i--) {
-    const entry = branch[i];
-    if (entry.type !== "message" || !token(entry.id)) continue;
-    const { role, content } = entry.message;
-    if (role !== "user" && role !== "assistant") continue;
-    failed ??= entry.message.role === "assistant" && entry.message.stopReason === "error";
-    let text = "";
-    if (typeof content === "string") {
-      text = cleanText(content);
-    } else {
-      for (const part of content.slice(0, 128)) {
-        if (part.type !== "text") continue;
-        text += (text ? "\n" : "") + cleanText(part.text);
-        if (text.length >= 1800) break;
+type Entry = ReturnType<ExtensionContext["sessionManager"]["getBranch"]>[number];
+type ChatMessage = Extract<Entry, { type: "message" }>["message"];
+type Assistant = Extract<ChatMessage, { role: "assistant" }>;
+type Row = { id: string; role: "user" | "assistant" | "custom" | "compaction" | "branch" | "tool" | "result";
+  text: string; at: number; part?: number };
+
+// Index the raw branch, not Pi's model projection: compaction and context edits must not erase chat.
+// Tool output stays in Pi's records. The snapshot carries a call's label, not its arguments or result.
+function indexBranch(branch: Entry[]) {
+  const rows: Row[] = [];
+  const positions = new Map(branch.map((e) => [e.id, 0]));
+  const calls = new Map<string, string>();
+  const results = new Map<string, Extract<ChatMessage, { role: "toolResult" }>>();
+  let failed = false;
+  for (const e of branch) {
+    const at = Date.parse(e.timestamp) || 0;
+    const row = (id: number, role: Row["role"], text: unknown) => {
+      if (typeof text !== "string") return;
+      const visible = cleanText(text);
+      if (!visible.trim()) return;
+      const head = { id: `${e.id}:${id}`, role, at };
+      if (visible.length <= TEXT_CHUNK) { rows.push({ ...head, text: visible }); return; }
+      // One huge message can span pages. The readers join its adjacent pieces back into the same block.
+      for (let start = 0, part = 0; start < visible.length; part++) {
+        let end = Math.min(visible.length, start + TEXT_CHUNK);
+        if (/[\ud800-\udbff]/.test(visible[end - 1])) end--;
+        rows.push({ ...head, text: visible.slice(start, end), part });
+        start = end;
       }
-    }
-    text = text.slice(0, 1800).replace(/[\ud800-\udfff]/gu, "\ufffd").trim();
-    if (text) items.push({ id: entry.id, role, text, at: Date.parse(entry.timestamp) || entry.message.timestamp || 0 });
+    };
+    const content = (role: Row["role"], parts: unknown) => {
+      if (typeof parts === "string") row(0, role, parts);
+      else if (Array.isArray(parts)) parts.forEach((p, i) => {
+        if (p?.type === "text") row(i, role, p.text);
+        else if (role === "assistant" && p?.type === "toolCall" && typeof p.id === "string" && typeof p.name === "string") {
+          calls.set(p.id, `${e.id}:${i}`);
+          row(i, "tool", p.name.slice(0, 120) || "tool");
+        }
+      });
+    };
+    if (e.type === "message") {
+      const m = e.message;
+      if (m.role === "user" || m.role === "assistant") {
+        failed = m.role === "assistant" && m.stopReason === "error";
+        content(m.role, m.content);
+      } else if (m.role === "toolResult") {
+        const id = calls.get(m.toolCallId);
+        if (id) { results.set(id, m); row(0, "result", id); }
+      }
+    } else if (e.type === "custom_message" && e.display === true) content("custom", e.content);
+    else if (e.type === "compaction") row(0, "compaction", e.summary);
+    else if (e.type === "branch_summary") row(0, "branch", e.summary);
+    positions.set(e.id, rows.length);
   }
-  return { items: items.reverse(), failed };
+  return { rows, positions, results, failed };
+}
+
+function page(rows: Row[], before: number, floor = 0, max = PAGE_BYTES) {
+  const items: Row[] = [];
+  let bytes = 0;
+  while (before > floor && items.length < PAGE_ROWS) {
+    const item = rows[before - 1];
+    const size = Buffer.byteLength(JSON.stringify(item)) + 1;
+    if (bytes + size > max) break;
+    before--;
+    bytes += size;
+    items.push(item);
+  }
+  return { before, items: items.reverse() };
+}
+
+// A session may never create a file, or use Pi's explicit --session path. A file is only an
+// identity check here. Pi owns parsing it, including migrations, partial records and the active leaf.
+function fileMark(path: string | undefined, old?: ReturnType<typeof fileStamp>) {
+  if (!path) return { stamp: undefined, replaced: Boolean(old) };
+  try {
+    const stamp = fileStamp(path, old);
+    const replaced = !!old && (stamp.identity !== old.identity || stamp.size < old.size ||
+      (stamp.size === old.size ? stamp.changed !== old.changed : !stamp.append));
+    return { stamp, replaced };
+  } catch { return { stamp: undefined, replaced: Boolean(old) }; }
+}
+
+function fileStamp(path: string, old?: { identity: string; size: number; changed: bigint; tail: Buffer }) {
+  const info = statSync(path, { bigint: true });
+  if (!info.isFile()) throw new Error("Not a session file");
+  const identity = `${info.dev}:${info.ino}:${info.birthtimeNs}`;
+  const size = Number(info.size);
+  const changed = info.ctimeNs;
+  if (old && identity === old.identity && size === old.size && changed === old.changed) return { ...old, append: true };
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (`${opened.dev}:${opened.ino}:${opened.birthtimeNs}` !== identity || !opened.isFile()) throw new Error("Session file changed");
+    const tail = Buffer.alloc(Math.min(size, 128));
+    readSync(fd, tail, 0, tail.length, size - tail.length);
+    let append = false;
+    if (old && identity === old.identity && size > old.size) {
+      const prior = Buffer.alloc(old.tail.length);
+      append = readSync(fd, prior, 0, prior.length, old.size - prior.length) === prior.length && prior.equals(old.tail);
+    }
+    return { identity, size, changed, tail, append };
+  } finally { closeSync(fd); }
 }
 
 export default function (pi: ExtensionAPI) {
   let stop: (() => Promise<void>) | undefined;
   let blocked = false;
+  let revision: (() => void) | undefined;
+  let live: { id: string; manager: ExtensionContext["sessionManager"]; session: string; leaf: string | null;
+    message: Assistant; final?: Assistant } | undefined;
   pi.on("ui_prompt_start", () => { blocked = true; });
   pi.on("ui_prompt_end", () => { blocked = false; });
+  pi.on("session_tree", () => { revision?.(); });
+  pi.on("message_start", ({ message }, ctx) => {
+    if (message.role === "assistant") live = { id: randomUUID(), manager: ctx.sessionManager,
+      session: ctx.sessionManager.getSessionId(), leaf: ctx.sessionManager.getLeafId() ?? null, message };
+  });
+  pi.on("message_update", ({ message }, ctx) => {
+    if (message.role !== "assistant") return;
+    if (live?.manager === ctx.sessionManager) live.message = message;
+    else live = { id: randomUUID(), manager: ctx.sessionManager, session: ctx.sessionManager.getSessionId(),
+      leaf: ctx.sessionManager.getLeafId() ?? null, message };
+  });
+  // Pi persists the message object after these handlers. Keep its identity, not the text
+  // passed to this event: other extensions can still replace the final content in place.
+  pi.on("message_end", ({ message }) => {
+    if (live && message.role === "assistant") live.final = message;
+  });
+  pi.on("turn_end", () => { live = undefined; });
+  pi.on("agent_end", () => { live = undefined; });
   pi.on("session_shutdown", async () => { await stop?.(); });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -92,28 +200,103 @@ export default function (pi: ExtensionAPI) {
     const temp = join(dir, `${pid}.${instance}.tmp`);
     const sockets = new Set<Socket>();
     const receipts = new Map<string, { digest: string; status: "accepted" | "queued" }>();
+    const manager = ctx.sessionManager;
+    let generation = randomUUID();
+    let lastSession: string | undefined;
+    let lastLeaf: string | null = null;
+    let lastPath: string | undefined;
+    let stamp: ReturnType<typeof fileStamp> | undefined;
+    let branch: Entry[] = [];
+    let index = indexBranch(branch);
+    let refresh = true;
+    revision = () => { generation = randomUUID(); refresh = true; live = undefined; };
+    function current() {
+      const session = manager.getSessionId();
+      const leaf = manager.getLeafId() ?? null;
+      const path = manager.getSessionFile?.();
+      const first = lastSession === undefined;
+      const file = fileMark(path, stamp);
+      const changed = !first && (session !== lastSession || lastPath !== path || file.replaced);
+      stamp = file.stamp;
+      if (changed) revision?.();
+      if (refresh || leaf !== lastLeaf) {
+        branch = manager.getBranch();
+        const next = indexBranch(branch);
+        if (!refresh && lastLeaf !== null && !next.positions.has(lastLeaf)) {
+          revision?.();
+        }
+        index = next;
+        refresh = false;
+      }
+      lastSession = session;
+      lastPath = path;
+      lastLeaf = leaf;
+      return { instance, session, leaf, generation };
+    }
 
     function dispatch(value: unknown) {
       if (!value || typeof value !== "object" || Array.isArray(value)) return error("invalid_request");
       const request = value as Record<string, unknown>;
       if (request.pid !== pid || request.instance !== instance) return error("stale_instance");
-      const session = ctx.sessionManager.getSessionId();
-      const leaf = ctx.sessionManager.getLeafId() ?? null;
+      const identity = current();
+      const { session, leaf } = identity;
       if (request.op === "snapshot") {
-        const { items, failed } = transcript(ctx);
-        const state = blocked ? "blocked" : !ctx.isIdle() ? "working" : !ctx.model || failed ? "error" : "idle";
-        return { ok: true, instance, session, leaf, state, items };
+        const state = blocked ? "blocked" : !ctx.isIdle() ? "working" : !ctx.model || index.failed ? "error" : "idle";
+        const floor = request.generation !== generation ? undefined : request.leaf === null ? 0 :
+          typeof request.leaf === "string" ? index.positions.get(request.leaf) : undefined;
+        const delta = floor === undefined ? undefined : page(index.rows, index.rows.length, floor);
+        const reset = !delta || delta.before !== floor;
+        // An append beyond the bounded delta window expires the cursor. Return a fresh page instead.
+        const result = reset ? page(index.rows, index.rows.length) : delta;
+        let overlay: Row[] = [];
+        if (live && live.manager === manager && live.session === session && (state === "working" || state === "blocked")) {
+          const { id, message, final, leaf: base } = live;
+          const from = base === null ? 0 : branch.findIndex((e) => e.id === base) + 1;
+          // The new branch may already contain the final record before Pi calls turn_end.
+          if ((base !== null && !from) || branch.slice(from).some((e) => e.type === "message" &&
+            (e.message === final || (!final && e.message.role === "assistant")))) live = undefined;
+          else if (Array.isArray(message.content)) {
+            const rows = message.content.flatMap((p, i): Row[] => p.type === "text" && p.text.trim() ?
+              [{ id: `live:${id}:${i}`, role: "assistant", text: cleanText(p.text, 4000), at: message.timestamp }] : []);
+            overlay = page(rows, rows.length, 0, LIVE_BYTES).items;
+          }
+        } else live = undefined;
+        return { ok: true, ...identity, state, reset, ...result, live: overlay };
+      }
+      if (request.op === "page" || request.op === "results") {
+        if (request.generation !== generation) return error("stale_revision");
+        if (request.op === "page") {
+          const before = request.before;
+          if (typeof before !== "number" || !Number.isSafeInteger(before) || before < 1 || before > index.rows.length) return error("stale_revision");
+          return { ok: true, ...identity, ...page(index.rows, before) };
+        }
+        if (!Array.isArray(request.ids) || request.ids.length > RESULT_LIMIT || !request.ids.every(token)) return error("invalid_request");
+        const outputs = request.ids.flatMap((id: string) => {
+          const result = index.results.get(id);
+          if (!result || !Array.isArray(result.content)) return [];
+          const parts: string[] = [];
+          let remaining = 1800;
+          for (const part of result.content) {
+            if (part?.type !== "text" || typeof part.text !== "string") continue;
+            parts.push(cleanText(part.text, remaining));
+            remaining -= part.text.length + 1;
+            if (remaining <= 0) break;
+          }
+          return [{ id, text: parts.join("\n") }];
+        });
+        return { ok: true, ...identity, outputs };
       }
       const { id, body, mode } = request;
       if (request.op !== "send" || !token(request.session) || (request.leaf !== null && !token(request.leaf)) ||
           !token(id) || typeof body !== "string" || Buffer.byteLength(body) > MAX_BODY || !body.trim() ||
           /[\x00\ud800-\udfff]/u.test(body) || (mode !== "now" && mode !== "hold")) return error("invalid_request");
       if (request.session !== session) return error("stale_session");
-      const digest = createHash("sha256").update(body).digest("hex");
+      const digest = createHash("sha256").update(JSON.stringify([session, body])).digest("hex");
       const receipt = receipts.get(id);
       if (receipt) return receipt.digest === digest ? { ok: true, status: receipt.status } : error("id_conflict");
+      if (request.generation !== undefined && request.generation !== generation) return error("stale_leaf");
       // A normal turn advances the leaf. A held message can follow that branch, not another one.
-      if (request.leaf !== null && request.leaf !== leaf && !ctx.sessionManager.getBranch().some((entry) => entry.id === request.leaf)) {
+      if (request.leaf !== null && request.leaf !== leaf && !index.positions.has(request.leaf)) {
         return error("stale_leaf");
       }
       const busy = !ctx.isIdle();
@@ -167,6 +350,8 @@ export default function (pi: ExtensionAPI) {
     const cleanup = async () => {
       if (stop !== cleanup) return;
       stop = undefined;
+      revision = undefined;
+      live = undefined;
       for (const socket of sockets) socket.destroy();
       try { unlink(registry); }
       finally {
