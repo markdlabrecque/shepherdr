@@ -618,10 +618,31 @@ class Install(unittest.TestCase):
             rel, text = sh.unit_text(tmp, "/usr/bin/bun", None)
             path = next(l for l in text.splitlines() if "PATH" in l)
             self.assertIn(prof, path)
-            self.assertEqual(sh.tool_dir("hc", "/home/u/.nix-profile/bin/hc"), "/home/u/.nix-profile/bin")
+            from unittest.mock import patch
+            with patch.object(sh.os.path, "realpath", return_value="/nix/store/fake-hc/bin/hc"):
+                self.assertEqual(sh.tool_dir("hc", os.path.join(prof, "hc")), prof)
         finally:
             os.environ["PATH"] = old
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_unit_path_has_pi(self):
+        """The service keeps Pi's discovered install directory on both launchd and systemd."""
+        from importlib.machinery import SourceFileLoader
+        from unittest.mock import patch
+        sh = SourceFileLoader("shepherdr_cli", SHEPHERDR).load_module()
+        with tempfile.TemporaryDirectory(prefix="shepherdr-pi-path-") as tmp:
+            pi_bin = os.path.join(tmp, ".pi", "agent", "bin")
+            os.makedirs(pi_bin)
+            pi = os.path.join(pi_bin, "pi")
+            with open(pi, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(pi, 0o755)
+            with patch.dict(os.environ, {"PATH": pi_bin}):
+                for platform in ("darwin", "linux"):
+                    with self.subTest(platform=platform), patch.object(sh.sys, "platform", platform):
+                        _, text = sh.unit_text(tmp, "/usr/bin/bun", None)
+                        path = next(line for line in text.splitlines() if "PATH" in line)
+                        self.assertIn(pi_bin, path)
 
     def test_update_web_only(self):
         """A web-only install updates web only (the record says so), and doctor says how; one whose source is gone says

@@ -431,7 +431,7 @@ def unit_text(root, bun, port=None):
     # hc, herdr-task and the helpers live in ~/.local/bin, which a user service's PATH lacks; and the tools herdr-task
     # and the agents run (gh, git, node, agent-browser, the CLIs…) where this install finds them (mise, nvm, brew…)
     # hc (herdr-core) too, wherever it is: a Nix or other package manager's install isn't in ~/.local/bin (GitHub #1048)
-    tools = ["hc", "herdr-app", "gh", "git", "node", "agent-browser", "claude", "codex", "python3", "tailscale", "pw-record",
+    tools = ["hc", "herdr-app", "gh", "git", "node", "agent-browser", "claude", "codex", "pi", "python3", "tailscale", "pw-record",
              "pw-play", "jq"]
     found = [tool_dir(t, p) for t in tools for p in [shutil.which(t)] if p]
     dirs = [os.path.join(root, BIN), os.path.dirname(bun), *found, "/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]

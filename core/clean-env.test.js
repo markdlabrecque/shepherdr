@@ -19,6 +19,21 @@ test("the agent is exec'd once, whether the template's command had exec or not",
   expect(cleanCommand("exec claude")).toBe(`${CLEAN_ENV} ${AGENT_PATH} exec claude`);
 });
 
+test("a minimal holder PATH finds managed Pi while keeping an existing Pi first", () => {
+  const home = mkdtempSync(`${tmpdir()}/clean-env-pi-`);
+  try {
+    const managed = `${home}/.pi/agent/bin`;
+    const own = `${home}/own`;
+    for (const dir of [managed, own]) mkdirSync(dir, { recursive: true });
+    writeFileSync(`${managed}/pi`, '#!/bin/sh\necho managed "$@"\n', { mode: 0o755 });
+    writeFileSync(`${own}/pi`, '#!/bin/sh\necho own "$@"\n', { mode: 0o755 });
+    for (const [path, expected] of [["/usr/bin:/bin", "managed"], [`${own}:/usr/bin:/bin`, "own"]]) {
+      const r = Bun.spawnSync(["/bin/sh", "-c", cleanCommand("pi --model test/model")], { env: { HOME: home, PATH: path } });
+      expect([r.exitCode, r.stdout.toString().trim()]).toEqual([0, `${expected} --model test/model`]);
+    }
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 test("a holder started over ssh (PATH only /usr/bin:/bin) still finds an agent in ~/.local/bin (GitHub #839)", () => {
   const home = mkdtempSync(`${tmpdir()}/clean-env-`);
   try {
