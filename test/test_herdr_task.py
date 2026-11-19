@@ -2827,8 +2827,8 @@ class ReviewAsAHelperAgent(unittest.TestCase):
         for words in (templates.WORKER_MD, worker):
             self.assertIn("--label herdr.role=reviewer", words)
             self.assertIn("herdr.task=$HERDR_BROWSER_TASK", words)
-            self.assertIn("codex --no-daemon --sandbox read-only", words)
-            self.assertIn("claude --permission-mode plan", words)
+            self.assertIn("pi --model <provider/model> --thinking <level>", words)
+            self.assertIn("herdr.agent=pi", words)
             self.assertIn("exactly as the Reviewer line gives it", words)
             self.assertIn("hc wait <its name>", words)
             self.assertNotIn("< /dev/null", words)
@@ -2978,14 +2978,14 @@ class ReviewerLine(unittest.TestCase):
         args = lambda **k: SimpleNamespace(**{"agent": None, "model": None, "effort": None, "reviewer": None,
                                               "reviewer_model": None, "reviewer_effort": None, "set": None, **k})
         with self.assertRaises(self.settings.Fail) as e:
-            self.settings.set_opts({}, args(reviewer_model="gpt-6.1-sol"))
+            self.settings.set_opts({}, args(reviewer="codex", reviewer_model="gpt-6.1-sol"))
         self.assertIn("gpt-6-sol, gpt-6-luna", str(e.exception))
         with self.assertRaises(self.settings.Fail):
-            self.settings.set_opts({}, args(set=["reviewer.model=gpt-6.1-sol"]))
+            self.settings.set_opts({}, args(set=["reviewer=codex", "reviewer.model=gpt-6.1-sol"]))
         t = {}
-        self.settings.set_opts(t, args(reviewer_model="gpt-6-sol"))
+        self.settings.set_opts(t, args(reviewer="codex", reviewer_model="gpt-6-sol"))
         self.assertEqual(t["reviewer_model"], "gpt-6-sol")
-        # a Claude model, or a Claude reviewer, isn't Codex's to judge
+        # The default Pi reviewer, or an explicit Claude reviewer, isn't Codex's to judge.
         self.settings.set_opts({}, args(reviewer_model="opus"))
         self.settings.set_opts({}, args(reviewer="claude", reviewer_model="some-model"))
 

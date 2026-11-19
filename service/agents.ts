@@ -91,14 +91,14 @@ export class Agents {
 
   /** Each CLI's own settings here (Settings › Agents' model menu: core/settings.js choicesFrom). */
   async ownDefaults() {
-    const [claude, codex] = await Promise.all([this.defaults("claude", null), this.defaults("codex", null)]);
-    return { claude, codex };
+    const pi = await this.defaults("pi", null);
+    return { pi };
   }
 
   /** What an unset role runs, in the window's words ("Opus 5.5 · 1M · High"): each CLI's own defaults here. */
   async defaultLines(): Promise<Record<string, string>> {
     const out: Record<string, string> = {};
-    for (const k of ["claude", "codex"]) {
+    for (const k of ["pi", "claude", "codex"]) {
       const d: any = await this.defaults(k, null).catch(() => null);
       if (d) out[k] = line({ agent: k, model: d.model, effort: d.effort ?? d.per?.[String(d.model ?? "").replace(/\[1m\]$/, "")] ?? null, fast: d.fast }).split(" · ").slice(1).join(" · ");
     }

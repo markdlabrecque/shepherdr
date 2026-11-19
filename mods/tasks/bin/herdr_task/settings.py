@@ -12,7 +12,7 @@ from .base import Fail, git, HOME, MAX_RUNNING, WHERE
 
 
 # What each agent key starts by default. Unknown keys run as themselves; --argv overrides.
-AGENTS = {"claude": ["claude"], "codex": ["codex", "--no-daemon"]}
+AGENTS = {"pi": ["pi"], "claude": ["claude"], "codex": ["codex", "--no-daemon"]}
 
 
 # ---- the person's settings ------------------------------------------------------------------
@@ -167,6 +167,13 @@ def argv_for(pick):
     if pick.get("argv"):
         return [str(x) for x in pick["argv"]]
     agent = pick.get("agent")
+    if agent == "pi":
+        a = ["pi"]
+        if pick.get("model"):
+            a += ["--model", pick["model"]]
+        if pick.get("effort"):
+            a += ["--thinking", pick["effort"]]
+        return a
     if agent == "claude":
         a = ["claude"]
         if pick.get("model"):
@@ -209,7 +216,7 @@ def worker_pick(s, task, space=None, agent=None):
         if key and key != pick.get("agent"):
             pick = {"agent": key}
     if not pick.get("agent") and not pick.get("argv"):
-        pick["agent"] = "claude"
+        pick["agent"] = "pi"
     for k in ("model", "effort"):
         if task.get(k):
             pick[k] = task[k]
@@ -222,7 +229,7 @@ def worker_argv(s, task, space=None, agent=None):
     if pick.get("argv") and not (task.get("model") or task.get("effort")):
         return argv_for(pick)
     pick.pop("argv", None)
-    pick.setdefault("agent", "claude")
+    pick.setdefault("agent", "pi")
     return argv_for(pick) or agent_argv(pick["agent"])
 
 
@@ -233,7 +240,7 @@ def argv_model(argv):
         nxt = argv[i + 1]
         if a in ("--model", "-m"):
             model = nxt
-        elif a == "--effort":
+        elif a in ("--effort", "--thinking"):
             effort = nxt
         elif a in ("-c", "--config") and nxt.startswith("model_reasoning_effort="):
             effort = nxt.split("=", 1)[1].strip("\"'")
@@ -316,7 +323,7 @@ def set_task(t, key, value):
         t.pop("set", None)
 
 
-def set_opts(t, args):
+def set_opts(t, args, s=None, space=None):
     """add/edit's --set pairs and --agent, --model, --effort, --reviewer, --reviewer-model,
     --reviewer-effort, in that order (a --set pair wins over its flag)."""
     for flag in ("agent", "model", "effort", "reviewer", "reviewer_model", "reviewer_effort"):
@@ -330,7 +337,7 @@ def set_opts(t, args):
         set_task(t, k, v)
     if getattr(args, "reviewer_model", None) or getattr(args, "reviewer", None) or any(
             SET_KEYS.get(p.split("=", 1)[0].strip().lower()) in ("reviewer", "reviewer_model") for p in getattr(args, "set", None) or []):
-        check_reviewer_model(t)
+        check_reviewer_model(t, s, space)
 
 
 def by_layer(s, space, section, key, value, default):
@@ -351,7 +358,7 @@ def cli_here(kind):
     return (((read_checks().get("machines") or {}).get("") or {}).get(kind))
 
 
-CLI_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+CLI_NAMES = {"pi": "Pi", "claude": "Claude Code", "codex": "Codex"}
 LOGIN = {"claude": "claude auth login", "codex": "codex login"}
 
 
@@ -374,13 +381,29 @@ def codex_lacks(model):
     return ids if model and ids and model not in ids else None
 
 
-CLAUDE_MODEL = re.compile(r"^(claude-|opus|sonnet|haiku|fable)", re.I)
+def reviewer_pick(cfg, t, agent):
+    """Resolve the reviewer's CLI and model from settings and task overrides, never from a model name."""
+    rv = dict(cfg.get("reviewer") or {})
+    if t.get("reviewer") and t["reviewer"] != rv.get("agent"):
+        rv = {"agent": t["reviewer"]}
+    for f in ("model", "effort"):
+        if t.get(f"reviewer_{f}"):
+            rv[f] = t[f"reviewer_{f}"]
+    other = {"claude": "codex", "codex": "claude"}.get(agent)
+    return rv, rv.get("agent") or (other if other and shutil.which(other) else agent)
 
 
-def check_reviewer_model(t):
-    """add/edit: a reviewer model Codex here can't use is refused when it is set (#948), not found at review time."""
+def check_reviewer_model(t, s=None, space=None):
+    """add/edit: only an actual Codex reviewer is subject to Codex's account-specific catalog (#948)."""
     m = t.get("reviewer_model")
-    if not m or t.get("reviewer") == "claude" or (not t.get("reviewer") and CLAUDE_MODEL.match(m)):
+    if not m:
+        return
+    space = space or t.get("space")
+    cfg = settings_for(s, space) if s is not None else DEFAULTS
+    argv = (t["agents"][-1].get("argv") if t.get("agents") else None)
+    argv = argv or (worker_argv(s, t, space) if s is not None else agent_argv(t.get("agent") or "pi"))
+    _, who = reviewer_pick(cfg, t, agent_key(argv))
+    if who != "codex":
         return
     ids = codex_lacks(m)
     if ids:
@@ -436,6 +459,8 @@ def reviewer_command(who, model=None, effort=None, folder=None):
             a += ["-c", "projects={" + ",".join(f'{json.dumps(r)}={{trust_level="trusted"}}' for r in roots) + "}"]
         a += ["-m", model] if model else []
         a += ["-c", f'model_reasoning_effort="{effort}"'] if effort else []
+    elif who == "pi":
+        a = argv_for({"agent": "pi", "model": model, "effort": effort})
     elif who == "claude":
         a = ["claude", "--permission-mode", "plan"]
         a += ["--model", model] if model else []
@@ -474,16 +499,9 @@ def task_settings(s, t, space=None, argv=None, live=False):
     argv = argv or (t["agents"][-1].get("argv") if t.get("agents") else None) or worker_argv(s, t, space)
     agent = agent_key(argv)
     if on:
-        rv = dict(cfg.get("reviewer") or {})
-        if t.get("reviewer") and t["reviewer"] != rv.get("agent"):
-            rv = {"agent": t["reviewer"]}
+        rv, want = reviewer_pick(cfg, t, agent)
         rv_by = "task" if any(t.get(f) for f in ("reviewer", "reviewer_model", "reviewer_effort")) else \
             by_layer(s, space, "reviewer", None, bool(cfg.get("reviewer")), False)
-        for f in ("model", "effort"):
-            if t.get(f"reviewer_{f}"):
-                rv[f] = t[f"reviewer_{f}"]
-        other = {"claude": "codex", "codex": "claude"}.get(agent)
-        want = rv.get("agent") or (other if other and shutil.which(other) else agent)
         who, said = want, ""
         if want != agent and cli_here(want) == "signed-out":
             # Signed out here, it would sit at its sign-in screen and never review (#745): the task's own CLI does.

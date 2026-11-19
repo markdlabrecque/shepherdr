@@ -2,7 +2,24 @@
 // rules both the window's model menu (lib/agent.js, mods/chat-models) and the web app's use. Reading an agent's own
 // settings and restarting it run where each side runs commands (lib/agent.js, service/agents.ts).
 // Shared core: the source is core/agents.js; bin/sync-shared copies it into the mods in lib/COPIES.
-export const NAMES = { claude: "Claude Code", codex: "Codex" };
+export const NAMES = { pi: "Pi", claude: "Claude Code", codex: "Codex" };
+const PI_EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+// The supported versions for Assistant, Worker and Reviewer. Providers come from Pi's catalog.
+export const PI_ROLE_MODELS = [
+  { id: "claude-fable-5-2", name: "Fable 5.2" },
+  { id: "claude-opus-5-5", name: "Opus 5.5" },
+  { id: "claude-sonnet-5-5", name: "Sonnet 5.5" },
+  { id: "claude-haiku-5-5", name: "Haiku 5.5" },
+  { id: "gpt-6.2-sol", name: "Sol 6.2" },
+  { id: "gpt-6.2-astra", name: "Astra 6.2" },
+  { id: "gpt-6.1-terra", name: "Terra 6.1" },
+  { id: "gpt-6-luna", name: "Luna 6" },
+];
+export function piRoleModel(id) {
+  if (typeof id !== "string") return null;
+  return PI_ROLE_MODELS.find((m) => m.id === id.slice(id.lastIndexOf("/") + 1)) ?? null;
+}
 
 // Claude Code's current models, as its /model menu offers them. `id` is what --model gets;
 // `match` the names a running agent may report for it.
@@ -66,7 +83,11 @@ function overrides(argv) {
 // The agent's own settings on its machine: Claude's settings.json, Codex's config.toml and
 // model list. Read once per agent process.
 export const DEFAULTS = `
-if [ "$1" = claude ]; then
+if [ "$1" = pi ]; then
+  f="\${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/settings.json"
+  command -v jq >/dev/null && [ -f "$f" ] && jq -r '"model\\t\\(if .defaultModel then ((.defaultProvider // "") + "/" + .defaultModel) else "" end)", "effort\\t\\(.defaultThinkingLevel // "")"' "$f" 2>/dev/null
+  pi --offline --list-models 2>/dev/null | awk 'NR > 1 && NF >= 5 {print "pi-model\\t" $1 "/" $2 "\\t" $5}'
+elif [ "$1" = claude ]; then
   f="$HOME/.claude/settings.json"
   command -v jq >/dev/null && [ -f "$f" ] && jq -r '"model\\t\\(.model // "")", "effort\\t\\(.effortLevel // "")", "fast\\t\\(if .fastMode == true then "on" else "" end)", "per\\t\\(.modelSettings // {} | with_entries(.value |= (.effortLevel // null)) | tojson)", "mode\\t\\(.permissions.defaultMode // "")"' "$f" 2>/dev/null
 else
@@ -89,6 +110,13 @@ export function parseDefaults(kind, stdout) {
   for (const line of (stdout ?? "").split("\n")) {
     const t = line.indexOf("\t");
     if (t > 0) out[line.slice(0, t)] = line.slice(t + 1);
+  }
+  if (kind === "pi") {
+    const models = (stdout ?? "").split("\n").filter((l) => l.startsWith("pi-model\t")).map((l) => {
+      const [, id, thinking] = l.split("\t");
+      return { id, label: id, efforts: thinking === "yes" ? PI_EFFORTS : ["off"], fast: false };
+    });
+    return { model: out.model || null, effort: out.effort || null, models };
   }
   let models = null;
   if (out.models) {
@@ -113,6 +141,9 @@ export function current(kind, argv, meta, dflt) {
   argv = argv ?? [];
   meta = meta ?? {};
   dflt = dflt ?? {};
+  if (kind === "pi") return { agent: "pi", model: meta.model ?? flag(argv, "--model", "-m") ?? dflt.model,
+    effort: meta.effort ?? flag(argv, "--thinking") ?? dflt.effort, fast: false, perm: null,
+    used: meta.used ?? null, window: meta.window ?? null };
   if (kind === "claude") {
     // a /model in place (SHEP-181) names the row it switched to, its 1M too, which the log's turns don't say
     const alias = meta.alias ?? flag(argv, "--model") ?? dflt.model;
@@ -155,7 +186,7 @@ export const speedName = (fast) => (fast === "ultrafast" ? "Ultrafast" : fast ? 
 export const speedFor = (m, fast) => (fast === "ultrafast" ? (m?.ultrafast ? "ultrafast" : m?.fast ? true : false) : Boolean(fast && m?.fast));
 
 // An effort level as the person reads it: "xhigh" -> "Extra high". The CLIs still get the raw value.
-const LEVELS = { minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max", ultra: "Ultra", none: "None" };
+const LEVELS = { off: "Off", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max", ultra: "Ultra", none: "None" };
 export function levelName(e) {
   return e ? LEVELS[e] ?? e[0].toUpperCase() + e.slice(1) : null;
 }
@@ -177,6 +208,13 @@ export function contextWords(c) {
 // offers (Codex: its own models_cache.json; Claude Code: its /model menu), the picker searches them.
 // `dflt` is that agent's settings (defaults()); `current` its running model, kept in the list.
 export function menuFor(agent, dflt, current = null) {
+  if (agent === "pi") {
+    const models = (dflt?.models ?? []).map((m) => ({ id: m.id, name: m.label ?? m.id,
+      efforts: m.efforts ?? PI_EFFORTS, defaultEffort: dflt?.effort ?? null, fast: false }));
+    const id = current ?? dflt?.model;
+    if (id && !models.some((m) => m.id === id)) models.unshift(typedModel("pi", id));
+    return { name: NAMES.pi, perms: [], models };
+  }
   if (agent === "claude") {
     const models = CLAUDE_MODELS.map((m) => ({ id: m.id, name: m.name, efforts: CLAUDE_EFFORTS,
       defaultEffort: dflt?.per?.[m.match[1].replace(/\[1m\]$/, "")] ?? dflt?.effort ?? null, fast: m.id.startsWith("opus") }));
@@ -192,7 +230,7 @@ export function menuFor(agent, dflt, current = null) {
 
 // The levels a model typed by id gets: its agent's usual ones.
 export function typedModel(agent, id) {
-  return { id, name: agent === "claude" ? modelName(id) : id, efforts: agent === "claude" ? CLAUDE_EFFORTS : ["low", "medium", "high", "xhigh"], defaultEffort: null, fast: false, typed: true };
+  return { id, name: agent === "claude" ? modelName(id) : id, efforts: agent === "pi" ? PI_EFFORTS : agent === "claude" ? CLAUDE_EFFORTS : ["low", "medium", "high", "xhigh"], defaultEffort: null, fast: false, typed: true };
 }
 
 // The person's picks in the model menus (the window's and the web's alike), in PICKS_FILE under the
@@ -241,6 +279,7 @@ export function modelSections(menus, agent, picks, q) {
   // a pinned or recent model typed by id (no CLI lists it) stays on offer
   const saved = (k) => {
     const models = menus?.[k]?.models ?? [], known = new Set(models.map((m) => m.id));
+    if (menus?.[k]?.allowTyped === false) return models;
     const ids = [...new Set([...picks.pinned, ...picks.recent].filter((x) => x.startsWith(`${k}:`)).map((x) => x.slice(k.length + 1)))];
     return [...models, ...ids.filter((id) => !known.has(id)).map((id) => ({ ...typedModel(k, id), typed: false }))];
   };
@@ -265,9 +304,9 @@ export function modelSections(menus, agent, picks, q) {
     if (rows.length) out.push(capped(k, m.name, k, rows));
   }
   // one word that could be an id, and no model has it: start any agent on it as typed
-  if (/^[\w.\[\]-]{2,60}$/.test(query)) {
+  if (/^[\w./:\[\]-]{2,200}$/.test(query)) {
     const rows = [agent, ...Object.keys(menus ?? {}).filter((x) => x !== agent)]
-      .filter((k) => menus?.[k] && !saved(k).some((m) => m.id === query)).map((k) => ({ agent: k, ...typedModel(k, query), pinned: false }));
+      .filter((k) => menus?.[k] && menus[k].allowTyped !== false && !saved(k).some((m) => m.id === query)).map((k) => ({ agent: k, ...typedModel(k, query), pinned: false }));
     if (rows.length) out.push({ key: "typed", title: "Use the id typed", agent, rows, more: 0 });
   }
   return out;
@@ -364,7 +403,14 @@ function stripSession(kind, argv) {
 // `session`: the old conversation's id when it can be resumed (same agent only).
 export function argvFor(pick, old) {
   const same = pick.agent === old.agent;
-  const flags = same ? kept(pick.agent, old.argv ?? []) : [];
+  const flags = same && pick.agent !== "pi" ? kept(pick.agent, old.argv ?? []) : [];
+  if (pick.agent === "pi") {
+    const a = ["pi"];
+    if (pick.model) a.push("--model", pick.model);
+    if (pick.effort) a.push("--thinking", pick.effort);
+    if (same && old.session) return { argv: [...a, "--session", old.session], resume: true, base: a };
+    return { argv: a, resume: false, base: a };
+  }
   if (pick.agent === "claude") {
     const a = ["claude", ...flags];
     if (pick.model) a.push("--model", pick.model);

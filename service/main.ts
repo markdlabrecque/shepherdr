@@ -244,13 +244,10 @@ setInterval(() => {
 const settings = new Settings();
 // a space's Assistant started from the web runs the agent Settings › Agents chooses for it, as the window's (#1051)
 compat.assistantPick = (space) => settings.role(space, "coordinator");
-// Settings › Agents' model menu and buttons (core/settings.js choicesFrom), from each CLI's own settings here, read
-// again every ten minutes; a CLI herdr-task's check finds missing here isn't offered
+// Settings › Agents' model menu and buttons use Pi's settings and catalog, read again every ten minutes.
 const readDefaults = async () => {
   try {
-    let check: any = {};
-    try { check = JSON.parse(readFileSync(where()["cli-check"], "utf8"))?.machines?.[""] ?? {}; } catch {}
-    settings.choices = SC.choicesFrom(await compat.agents!.ownDefaults(), { claude: check.claude !== "missing", codex: check.codex !== "missing" });
+    settings.choices = SC.choicesFrom(await compat.agents!.ownDefaults());
     model.rebuild();
   } catch {}
 };

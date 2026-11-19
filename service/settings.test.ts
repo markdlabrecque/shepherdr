@@ -32,9 +32,9 @@ test("a space's own values go in its layer with its folder, and Reset drops them
   s.start();
   const scope = { id: "sp2", name: "web", machine: null, folder: "/repo" };
   s.set("tasks.merge", "Right away", "sp2", scope);
-  s.set("role.worker", JSON.stringify({ agent: "codex", model: "gpt-5", effort: "high" }), "sp2", scope);
+  s.set("role.worker", JSON.stringify({ agent: "pi", model: "openai/gpt-6.2-sol", effort: "high" }), "sp2", scope);
   let f = JSON.parse(readFileSync(file, "utf8"));
-  expect(f.spaces.sp2).toEqual({ folder: "/repo", name: "web", tasks: { merge: "auto" }, worker: { agent: "codex", model: "gpt-5", effort: "high", fast: false, perm: null } });
+  expect(f.spaces.sp2).toEqual({ folder: "/repo", name: "web", tasks: { merge: "auto" }, worker: { agent: "pi", model: "openai/gpt-6.2-sol", effort: "high", fast: false, perm: null } });
   const tasks = s.sections(null, [scope]).find((x) => x.name === "Tasks" && x.level === "sp2")!;
   // as the window's: "Set for this space · Reset", Reset back to Everywhere's; Base branch only in a space's own
   expect(tasks.rows.find((r) => r.key === "tasks.merge")).toMatchObject({ value: "Right away", inherits: { from: "Everywhere" } });
@@ -43,6 +43,24 @@ test("a space's own values go in its layer with its folder, and Reset drops them
   f = JSON.parse(readFileSync(file, "utf8"));
   expect(f.spaces.sp2.tasks).toBeUndefined();
   expect(() => s.set("tasks.merge", "Right away", "sp3", null)).toThrow();
+});
+
+test("all role selections save Pi models and thinking without permissions or speed", () => {
+  const s = new Settings();
+  s.start();
+  for (const role of ["coordinator", "worker", "reviewer"]) {
+    for (const model of ["pi-claude-subscription/claude-fable-5-2", "pi-claude-subscription/claude-opus-5-5", "pi-claude-subscription/claude-sonnet-5-5", "pi-claude-subscription/claude-haiku-5-5", "openai/gpt-6.2-sol", "openai/gpt-6.2-astra", "openai/gpt-6.1-terra", "openai/gpt-6-luna"]) {
+      s.set(`role.${role}`, JSON.stringify({ agent: "pi", model, effort: "high", fast: true, perm: "full" }));
+      const saved = JSON.parse(readFileSync(file, "utf8")).everywhere[role];
+      expect(saved).toEqual({ agent: "pi", model, effort: "high", fast: false, perm: null });
+    }
+    for (const model of ["openai/gpt-6-sol", "provider/model", "pi-claude-subscription/claude-opus-4-6"]) {
+      expect(() => s.set(`role.${role}`, JSON.stringify({ agent: "pi", model }))).toThrow("Pick a supported Pi model.");
+    }
+    s.set(`role.${role}`, null);
+  }
+  expect(() => s.set("role.worker", JSON.stringify({ agent: "codex" }))).toThrow("Pick a supported Pi model.");
+  expect(() => s.set("role.worker", JSON.stringify({ agent: "pi", effort: "invalid" }))).toThrow("Not a Pi thinking level.");
 });
 
 test("Branch names (#570): Everywhere's or a space's own pattern, checked before it's kept", () => {
@@ -163,15 +181,15 @@ test("Machines is one page as the window's: every machine's limits, then each ma
   expect(JSON.parse(readFileSync(file, "utf8")).everywhere.machine.start_load).toBe(1.75);
 });
 
-test("Agents and Tasks say the window's words: the model button, Other CLI, Must fix only with a review", async () => {
+test("Agents and Tasks say the window's words: Pi model buttons, Must fix only with a review", async () => {
   const C: any = await import("../core/settings.js");
   const s = new Settings();
   s.start();
-  s.choices = C.choicesFrom({ claude: { model: "opus[1m]", effort: "high", per: {} }, codex: { models: [{ id: "gpt-5", label: "GPT-5", efforts: ["low", "high"] }] } });
+  s.choices = C.choicesFrom({ pi: { model: "openai/gpt-6.2-sol", effort: "high", models: [{ id: "openai/gpt-6.2-sol" }] } });
   const agents = s.sections(null).find((x) => x.name === "Agents" && x.level === "all")!;
   expect(agents.rows.map((r) => r.label)).toEqual(["Assistant", "Workers", "Reviewer", "Backup agent", "Reactions", "Suggested next message", "Feedback offers", "Feedback repo"]);
-  expect(agents.rows[0].value).toBe("Opus 5.5 · 1M · High");
-  expect(agents.rows[2]).toMatchObject({ value: "Other CLI (Codex)", agent: { unset: true, other: false } });
+  expect(agents.rows[0].value).toBe("Sol 6.2 · High");
+  expect(agents.rows[2]).toMatchObject({ value: "Sol 6.2 · High", agent: { unset: true, other: false } });
   const tasks = s.sections(null).find((x) => x.name === "Tasks" && x.level === "all")!;
   expect(tasks.rows.some((r) => r.key === "tasks.must_fix")).toBe(false);
   expect(tasks.rows.find((r) => r.key === "tasks.max_running")).toMatchObject({ hint: C.ABOUT["tasks.max_running"], steps: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"] });

@@ -108,8 +108,8 @@ def cmd_add(args):
         # The person's setting wins: worktrees off for this repo means in the folder, --worktree or not.
         mode = "here" if args.here or not worktrees_on(s) else "worktree"
         t = s.new(args.title.strip(), prompt, mode)
-        set_opts(t, args)
         space = bare(args.space) if args.space else caller_space()
+        set_opts(t, args, s, space)
         set_base(s, t, args.base, space, new=True)
         set_branch(s, t, getattr(args, "branch", None))
         set_notes(t, args)
@@ -847,7 +847,7 @@ def cmd_edit(args):
             with open(args.prompt_file) as f:
                 t["prompt"] = f.read()
         pick = [t.get(k) for k in ("agent", "model", "effort")]
-        set_opts(t, args)
+        set_opts(t, args, s)
         if [t.get(k) for k in ("agent", "model", "effort")] != pick:
             # The next agent started for it runs on the new choice (start_again), a queued one too.
             t["pick_at"] = now()

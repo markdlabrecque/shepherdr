@@ -79,7 +79,7 @@ export async function execTemplate(hub: Hub, name: string, machine: string | nul
   if (!head || !own) return plain;
   const has = async (prog: string) => (await exec(hub, ["sh", "-c", `${AGENT_PATH} command -v "$1" >/dev/null 2>&1`, "x", prog], machine).catch(() => null))?.code === 0;
   let cmd = own;
-  if (pick?.agent === "claude" || pick?.agent === "codex") {
+  if (pick?.agent === "pi" || pick?.agent === "claude" || pick?.agent === "codex") {
     if (await has(pick.agent)) cmd = argvFor(pick, { agent: null, argv: [] }).argv.map(shellWord).join(" ");
     else if (!(await has(own.split(/\s+/)[0]))) {
       throw new Error(`${(NAMES as Record<string, string>)[pick.agent] ?? pick.agent} isn't installed on ${machine ?? "this computer"}. Install it, or pick another agent for the Assistant in Settings › Agents.`);

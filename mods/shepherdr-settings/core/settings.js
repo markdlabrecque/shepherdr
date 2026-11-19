@@ -3,7 +3,7 @@
 // web app's Settings say the same. herdr-task reads the file (herdr_task/settings.py: settings_for); its defaults are
 // DEFAULTS there and here.
 // Shared core: the source is core/settings.js; bin/sync-shared copies it into the mods in lib/COPIES.
-import { NAMES, levelName, current, rowFor, menuFor, permAcross, speedName, speedFor } from "./agents.js";
+import { NAMES, levelName, current, rowFor, menuFor, permAcross, speedName, speedFor, piRoleModel } from "./agents.js";
 import { SERVE } from "./host.js";
 
 // ---- the frame -------------------------------------------------------------------------------------------------
@@ -79,11 +79,11 @@ export const INSTRUCTIONS = {
     heartbeat: "Autopilot's heartbeat, plain text: an Assistant on Autopilot gets it on every wake. Changes apply from the next wake.",
   },
 };
-export const USE_OTHER_CLI = "Use other CLI";
+export const USE_OTHER_CLI = "Use Pi defaults";
 export const LOADING_AGENTS = "Loading agents…";
 // An unset Reviewer's button: what runs, the other CLI.
 export const otherCliWords = (cli) => `Other CLI (${NAMES[cli] ?? cli})`;
-export const otherCli = (worker) => (worker === "codex" ? "claude" : "codex");
+export const otherCli = (worker) => (worker === "pi" ? "pi" : worker === "codex" ? "claude" : "codex");
 // Reactions (herdr-task's reactions.py): every agent (Assistants, task workers, automation runs, agent tabs) reacts to
 // some of your messages with an emoji; off, none does. Kept as agents.reactions; SHEP-42 kept it as assistant.reactions
 // (upgradeReactions moves it).
@@ -141,22 +141,24 @@ export function modelLabel(menus, sel) {
   const level = sel?.effort ?? m?.defaultEffort ?? null;
   return [m?.name ?? sel?.model, levelName(level), speedName(sel?.fast)].filter(Boolean).join(" · ") || "Choose a model";
 }
-// What the agents offer, from each CLI's own settings (agents.js parseDefaults) and which are installed:
-// { menus, permDefault, defaults } (defaults: the first installed CLI's own, what an unset role runs).
-export function choicesFrom(dflts, installed = { claude: true, codex: true }) {
-  const menus = Object.fromEntries(["claude", "codex"].filter((k) => installed[k]).map((k) => [k, menuFor(k, dflts[k])]));
-  const permDefault = { claude: dflts.claude?.mode ?? "manual", codex: "auto" };
-  const first = menus.claude ? "claude" : Object.keys(menus)[0] ?? "claude";
+// Role selectors offer only the supported versions available in Pi's catalog.
+// Unlike chat restart menus, they cannot add arbitrary IDs through search or saved picks.
+export function choicesFrom(dflts) {
+  const pi = menuFor("pi", dflts.pi);
+  pi.models = pi.models.filter((m) => !m.typed && piRoleModel(m.id))
+    .map((m) => ({ ...m, name: piRoleModel(m.id).name }));
+  pi.allowTyped = false;
+  const menus = { pi };
+  const permDefault = { pi: null };
+  const first = "pi";
   const c = current(first, [], {}, dflts[first]);
-  const model = rowFor(first, c) ?? menus[first]?.models?.[0]?.id ?? null;
+  const id = rowFor(first, c);
+  const model = pi.models.find((m) => m.id === id)?.id ?? pi.models[0]?.id ?? null;
   return { menus, permDefault, defaults: { agent: first, model, effort: c.effort ?? null, fast: false, perm: permDefault[first] } };
 }
-// What a role's model button starts from: its own choice, else for the Reviewer the other CLI, else the defaults.
+// What a role's model button starts from: its saved Pi choice, otherwise Pi's defaults.
 export function roleSel(role, own, choices, worker) {
-  if (own) return { sel: { ...own }, unset: false };
-  const o = otherCli(worker);
-  if (role === "reviewer" && choices?.menus?.[o])
-    return { sel: { agent: o, model: choices.menus[o].models[0]?.id ?? null, effort: null, fast: false, perm: choices.permDefault?.[o] ?? null }, unset: true };
+  if (own?.agent === "pi") return { sel: { ...own, fast: false, perm: null }, unset: false };
   return { sel: choices?.defaults ? { ...choices.defaults } : null, unset: true };
 }
 // A model picked in the menu: the effort and speed stay where it has them; another agent brings its own permission

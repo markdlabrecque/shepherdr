@@ -109,7 +109,11 @@ WORKER_MD_BEFORE_ASK = WORKER_MD_BEFORE_OFTEN.replace(OFTEN_OLD, OFTEN_RULE).rep
 ASK_OLD = "Anything else: ask the person in one short message. Then run ready again."
 ASK_RULE = ("Anything else: ask the person with your CLI's question tool, as below (a question in plain text reaches "
             "nobody while the task is Ready). Then run ready again.")
-WORKER_MD = WORKER_MD_BEFORE_ASK.replace(ASK_OLD, ASK_RULE)
+WORKER_MD_BEFORE_PI = WORKER_MD_BEFORE_ASK.replace(ASK_OLD, ASK_RULE)
+WORKER_MD = WORKER_MD_BEFORE_PI.replace("herdr.agent=<codex or claude>", "herdr.agent=pi").replace(
+    "(`codex --no-daemon --sandbox read-only …` or `claude --permission-mode plan …`; never `codex exec` or `claude -p`: nobody sees those)",
+    "(`pi --model <provider/model> --thinking <level>`; never `pi -p`: nobody sees that)",
+)
 
 REVIEWER_MD_BEFORE_SUBAGENT = """You review one Herdr task's work before it can merge. Read only: never edit files, commit or push.
 - Read the task, then the diff of its branch against its base, and run the project's checks.
@@ -142,15 +146,15 @@ OLD_WORKER_READY = """You work on one Herdr task. Stay within the task's scope a
 - When the work is finished, run the `herdr-task ready` command given at the end of your brief, with a short summary. That puts the task in Ready for the person, who accepts it. Never mark a task done yourself.
 """
 OLD_WORKER_MD = OLD_WORKER_READY.split("- When the work is finished")[0]
-OLD_WORKERS = (WORKER_MD_BEFORE_ASK, WORKER_MD_BEFORE_OFTEN, WORKER_MD_BEFORE_SUGGEST, WORKER_MD_BEFORE_COMMAND, WORKER_MD_BEFORE_FEEDBACK, WORKER_MD_BEFORE_SUBAGENTS, WORKER_MD_BEFORE_LEFT, WORKER_MD_BEFORE_DETAILS, WORKER_MD_BEFORE_CUT, WORKER_MD_BEFORE_ESTIMATE, WORKER_MD_BEFORE_SUMMARY, WORKER_MD_BEFORE_GATE, WORKER_MD_BEFORE_TEMPLATES, WORKER_MD_BEFORE_NEWS, OLD_WORKER_READY, OLD_WORKER_MD, OLD_WORKER_MD.replace(OLD_WORKER_MD.split("\n")[0], OLD_WORKER_FIRST), OLD_WORKER_REVIEW)
+OLD_WORKERS = (WORKER_MD_BEFORE_PI, WORKER_MD_BEFORE_ASK, WORKER_MD_BEFORE_OFTEN, WORKER_MD_BEFORE_SUGGEST, WORKER_MD_BEFORE_COMMAND, WORKER_MD_BEFORE_FEEDBACK, WORKER_MD_BEFORE_SUBAGENTS, WORKER_MD_BEFORE_LEFT, WORKER_MD_BEFORE_DETAILS, WORKER_MD_BEFORE_CUT, WORKER_MD_BEFORE_ESTIMATE, WORKER_MD_BEFORE_SUMMARY, WORKER_MD_BEFORE_GATE, WORKER_MD_BEFORE_TEMPLATES, WORKER_MD_BEFORE_NEWS, OLD_WORKER_READY, OLD_WORKER_MD, OLD_WORKER_MD.replace(OLD_WORKER_MD.split("\n")[0], OLD_WORKER_FIRST), OLD_WORKER_REVIEW)
 
 
 TEMPLATE_HEADS = {
     "worker": "---\nname: worker\ndescription: Works on one Herdr task in its folder or its own git worktree: commits as it goes, "
               "says how it is going with herdr-task status, and herdr-task ready when finished. herdr-task starts it with the "
-              "task's brief after these words.\ncommand: claude\n---\n",
+              "task's brief after these words.\ncommand: pi\n---\n",
     "reviewer": "---\nname: reviewer\ndescription: Reviews one Herdr task's work read-only before it merges and reports each "
-                "finding with a level (blocker, major, minor).\ncommand: claude\n---\n",
+                "finding with a level (blocker, major, minor).\ncommand: pi\n---\n",
 }
 FRONT = re.compile(r"\A---[ \t]*\n.*?\n---[ \t]*(?:\n|\Z)", re.S)
 

@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import * as S from "./settings.js";
+import { menuFor, modelSections } from "./agents.js";
 
 const ROOT = join(import.meta.dir, "..");
 const read = (f) => readFileSync(join(ROOT, f), "utf8");
@@ -38,18 +39,54 @@ test("the model menu's headings are the window's (mods/chat-models)", () => {
 });
 
 test("the model button says what the window's does", () => {
-  const { menus, defaults } = S.choicesFrom({ claude: { model: "opus[1m]", effort: "high", per: {} }, codex: { models: [{ id: "gpt-5", label: "GPT-5", efforts: ["low", "high"] }] } });
-  expect(S.modelLabel(menus, defaults)).toBe("Opus 5.5 · 1M · High");
-  expect(S.modelLabel(menus, { agent: "claude", model: "opus", effort: "xhigh", fast: true })).toBe("Opus 5.5 · Extra high · Fast");
-  expect(S.roleSel("reviewer", null, { menus, defaults, permDefault: { codex: "auto" } }, "claude")).toMatchObject({ unset: true, sel: { agent: "codex", model: "gpt-5" } });
-  expect(S.otherCliWords(S.otherCli("claude"))).toBe("Other CLI (Codex)");
-  // another CLI's model: its own permission modes, full access staying full access
-  expect(S.chooseModel(menus, { codex: "auto" }, { agent: "claude", model: "opus", effort: "max", perm: "bypassPermissions" }, "codex", "gpt-5"))
-    .toMatchObject({ agent: "codex", model: "gpt-5", effort: null, perm: "full" });
+  const choices = S.choicesFrom({ pi: { model: "openai/gpt-6.2-sol", effort: "high", models: [{ id: "openai/gpt-6.2-sol", efforts: ["low", "high"] }] } });
+  expect(Object.keys(choices.menus)).toEqual(["pi"]);
+  expect(choices.menus.pi.perms).toEqual([]);
+  expect(S.modelLabel(choices.menus, choices.defaults)).toBe("Sol 6.2 · High");
+  for (const role of ["coordinator", "worker", "reviewer"]) {
+    expect(S.roleSel(role, null, choices, "pi")).toEqual({ unset: true, sel: choices.defaults });
+    expect(S.roleSel(role, { agent: "pi", model: "openai/gpt-6.2-sol", effort: "high" }, choices, "pi").sel.effort).toBe("high");
+  }
+});
+
+test("role menus offer only the eight supported versions, with catalog providers and thinking levels", () => {
+  const supported = [
+    ["claude-fable-5-2", "Fable 5.2"], ["claude-opus-5-5", "Opus 5.5"],
+    ["claude-sonnet-5-5", "Sonnet 5.5"], ["claude-haiku-5-5", "Haiku 5.5"],
+    ["gpt-6.2-sol", "Sol 6.2"], ["gpt-6.2-astra", "Astra 6.2"],
+    ["gpt-6.1-terra", "Terra 6.1"], ["gpt-6-luna", "Luna 6"],
+  ].map(([id, name]) => ({ id: `${id.startsWith("claude") ? "pi-claude-subscription" : "openai"}/${id}`, name }));
+  const older = ["openai/gpt-6-sol", "openai/gpt-6.1-sol", "openai/gpt-6-astra", "openai/gpt-5.6-luna", "other/claude-opus-4-6"];
+  const models = [...supported, ...older.map((id) => ({ id })), { id: "bedrock/claude-opus-5-5" }]
+    .map((m) => ({ ...m, efforts: ["low", "high"] }));
+  const { menus, defaults } = S.choicesFrom({ pi: { model: "openai/gpt-6.2-sol", effort: "high", models } });
+  expect(menus.pi.models.map(({ id, name }) => ({ id, name }))).toEqual([...supported, { id: "bedrock/claude-opus-5-5", name: "Opus 5.5" }]);
+  expect(menus.pi.models.every((m) => m.efforts.join() === "low,high" && !m.fast)).toBe(true);
+  expect(defaults.model).toBe("openai/gpt-6.2-sol");
+  const picks = { pinned: [`pi:${older[0]}`, `pi:${supported[0].id}`], recent: [`pi:${older[1]}`] };
+  const rows = modelSections(menus, "pi", picks, "").flatMap((s) => s.rows);
+  expect(rows).toHaveLength(9);
+  expect(rows[0]).toMatchObject({ id: supported[0].id, pinned: true });
+  for (const query of older) {
+    const matches = modelSections(menus, "pi", picks, query).flatMap((s) => s.rows);
+    expect(matches.every((r) => !r.typed && !older.includes(r.id))).toBe(true);
+  }
+  expect(modelSections(menus, "pi", picks, "provider/arbitrary-model")).toEqual([]);
+  expect(modelSections(menus, "pi", picks, "sol")[0].rows.map((r) => r.id)).toEqual(["openai/gpt-6.2-sol"]);
+});
+
+test("unsupported defaults and missing catalogs cannot insert extra role models", () => {
+  const pi = { model: "openai/gpt-6-sol", models: [{ id: "openai/gpt-6.2-sol" }] };
+  expect(S.choicesFrom({ pi }).defaults.model).toBe("openai/gpt-6.2-sol");
+  const missing = S.choicesFrom({ pi: { model: "openai/gpt-6.2-sol" } });
+  expect(missing.menus.pi.models).toEqual([]);
+  expect(missing.defaults.model).toBeNull();
+  expect(S.choicesFrom({}).menus.pi.models).toEqual([]);
 });
 
 test("switching the worker's agent there and back keeps auto (#758)", () => {
-  const { menus, permDefault } = S.choicesFrom({ claude: { model: "opus", per: {} }, codex: { models: [{ id: "gpt-5", label: "GPT-5", efforts: ["low", "high"] }] } });
+  const menus = { claude: menuFor("claude", { model: "opus", per: {} }), codex: menuFor("codex", { models: [{ id: "gpt-5", label: "GPT-5", efforts: ["low", "high"] }] }) };
+  const permDefault = { claude: "manual", codex: "auto" };
   expect(permDefault.claude).toBe("manual");
   const toCodex = S.chooseModel(menus, permDefault, { agent: "claude", model: "opus", perm: "auto" }, "codex", "gpt-5");
   expect(toCodex.perm).toBe("auto");

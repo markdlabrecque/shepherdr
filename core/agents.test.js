@@ -4,6 +4,23 @@ import { argvFor, current, forkArgv, FORK_LIVE, line, liveTaskAgent, menuFor, mo
 const codex = { models: Array.from({ length: 250 }, (_, i) => ({ id: `gpt-${i}`, label: `GPT ${i}`, efforts: ["low", "high"] })) };
 const menus = { claude: menuFor("claude", {}), codex: menuFor("codex", codex) };
 
+test("Pi models carry provider IDs, thinking levels and no permission choices", () => {
+  const d = parseDefaults("pi", "model\topenai/gpt-test\neffort\tmedium\npi-model\topenai/gpt-test\tyes\npi-model\tother/plain\tno\n");
+  const menu = menuFor("pi", d);
+  expect(menu.name).toBe("Pi");
+  expect(menu.perms).toEqual([]);
+  expect(menu.models[0].efforts).toEqual(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  expect(menu.models[1].efforts).toEqual(["off"]);
+  expect(current("pi", ["pi", "--model", "other/plain", "--thinking", "off"], {}, d)).toMatchObject({ agent: "pi", model: "other/plain", effort: "off", perm: null });
+  expect(argvFor({ agent: "pi", model: "openai/gpt-test", effort: "high", perm: "full", fast: true }, { agent: "claude" }).argv)
+    .toEqual(["pi", "--model", "openai/gpt-test", "--thinking", "high"]);
+  expect(argvFor({ agent: "pi", effort: "off" }, { agent: "pi", session: "session-file.jsonl" }).argv)
+    .toEqual(["pi", "--thinking", "off", "--session", "session-file.jsonl"]);
+  expect(modelSections({ pi: menu }, "pi", parsePicks(""), "new-provider/new-model")).toMatchObject([
+    { key: "typed", rows: [{ agent: "pi", id: "new-provider/new-model" }] },
+  ]);
+});
+
 test("Codex lists every model it has, not its first five", () => {
   expect(menus.codex.models.length).toBe(250);
 });
