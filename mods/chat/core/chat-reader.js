@@ -12,8 +12,9 @@ export const PAGE = 200;
 export const KEEP = 2000;
 export const KINDS = { "claude-code": "claude", claude: "claude", codex: "codex", pi: "pi" };
 
-// The CLI a terminal runs, as the chat knows them ("claude", "codex"), else null.
-export const kindOf = (t) => KINDS[t?.status?.app] ?? KINDS[t?.foreground?.name] ?? null;
+// A Node-launched Pi can report "node" as its foreground name before there is an app status.
+export const kindOf = (t) => KINDS[t?.status?.app] ?? KINDS[t?.foreground?.name]
+  ?? (String(t?.foreground?.argv?.[0] ?? "").split("/").pop() === "pi" ? "pi" : null);
 
 export class ChatReader {
   constructor(io, addr) {

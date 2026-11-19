@@ -133,6 +133,7 @@ const live = new Live(hub, store, () => me, VERSION, ownLink);
 const compat = new Compat();
 const model = new Model(hub, live);
 live.chats = new Chats(hub);
+compat.onPiSend = (a) => live.chats?.refresh(a);
 live.compat = compat;
 compat.reader = (a) => live.chats?.reader(a) ?? null;
 // the chat scrolled to its top: the page before (as the window's loadEarlier)
@@ -341,6 +342,7 @@ const snapshotOf = (b: Parameters<NonNullable<typeof model.onBuild>>[0]) => live
 // a task that moved on (accepted, done) changes its news lines in its Assistant's chat, whose conversation may not move:
 // open chats are told again (compat.chat reads the rows the snapshot just took)
 let newsWas: string | null = null;
+live.onPiTab = () => model.rebuild();
 model.onBuild = (b) => {
   snapshotOf(b);
   const now = newsKey(b.rows);

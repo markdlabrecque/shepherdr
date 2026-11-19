@@ -622,7 +622,7 @@ export function piConversation(items, { session, generation, state } = {}) {
   for (const x of blocks) {
     const at = typeof x.at === "number" ? x.at : Date.parse(x.at ?? "") || undefined;
     const id = prefix + x.id;
-    if (x.role === "user") { open.clear(); conv.user(id, { ...cleanUser(x.text), at }); }
+    if (x.role === "user") { open.clear(); conv.user(id, { ...cleanUser(x.text), piBody: x.text, at }); }
     else if (x.role === "assistant" || x.role === "error") {
       if (x.text.trim()) conv.push({ kind: x.role === "error" ? "error" : "agent", id, at, text: x.text,
         ...(x.provisional ? { provisional: true } : {}), ...(x.from ? { renderId: prefix + x.from } : {}) });
@@ -753,7 +753,8 @@ export class Conversation {
       replyTo = u.quoted;
       text = u.rest;
     }
-    this.push({ kind: "user", id, text, replyTo, from: u.from, ...(u.assistant ? { assistant: u.assistant } : {}), at: u.at, images: u.images || 0 });
+    this.push({ kind: "user", id, text, replyTo, from: u.from, ...(u.assistant ? { assistant: u.assistant } : {}),
+      ...(u.piBody !== undefined ? { piBody: u.piBody } : {}), at: u.at, images: u.images || 0 });
     this.doing = null;
   }
 

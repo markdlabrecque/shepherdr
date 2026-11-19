@@ -116,7 +116,9 @@ export function settle(out: Outgoing[], chat: Chat, now = Date.now()): Outgoing[
       changed = true
       return [{ ...o, waiting: undefined, queued: undefined, wentAt: now }]
     }
-    if (o.state === 'sending' || o.waiting || o.serverAt === undefined) return [o]
+    // Pi's bridge only acknowledges submission. Only the service can match a new Pi record
+    // to the exact submitted body, including tags and file paths not shown in the bubble.
+    if (chat.cli === 'pi' || o.state === 'sending' || o.waiting || o.serverAt === undefined) return [o]
     const parts = sameAs(o, chat, taken)
     if (!parts) {
       if (o.pastAt || !(o.state === 'sent' || o.lost) || !movedPast(o, chat)) return [o]

@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import { readFileSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { ChatReader } from "../core/chat-reader.js";
-import { piSend, piTarget, piHistoryOf, piQuoteFor, samePiHistory, PI_BLOCKED, PI_UNCONFIRMED, PI_UNAVAILABLE } from "../core/pi-chat.js";
+import { excerpt } from "../core/chat-log.js";
+import { ownWords } from "../core/chat-view.js";
+import { piSend, piTarget, piHistoryOf, piQuoteFor, piVisibleBody, samePiHistory, PI_BLOCKED, PI_UNCONFIRMED, PI_UNAVAILABLE } from "../core/pi-chat.js";
 import { messageBody, refusal, sendTyped } from "../core/send.js";
 
 // Run the actual window methods without starting herdr-app or loading its settings.
@@ -33,6 +35,62 @@ test("the window pulls a qualified Pi snapshot and uses its status, not the term
   await pull.call(self, { notify: () => changed.push(1) });
   expect(self.phase).toBe("pi-unavailable");
   expect(changed).toHaveLength(2);
+});
+
+test("desktop Pi steering receipts stay pending until a new user record consumes each send", async () => {
+  const active = { ...snapshot, generation: "g1", reset: true, before: 0, state: "working" };
+  const at = Date.now();
+  const reply = { id: "reply", role: "assistant", text: "First Pi reply", at };
+  const words = "please\r\n\x1b[31mcontinue\x1b[0m\u202e";
+  const tags = '<hc reply-to="First Pi reply"/>\n<hc task="7">brief</hc>\n';
+  const user = { id: "old", role: "user", text: tags + "please\ncontinue", at };
+  let items = [user, reply];
+  const reader = new ChatReader({ sh: async () => json({ ...active, items }) }, addr);
+  await reader.locate({ state: "live", foreground: { name: "pi", pid: 77 } });
+  const sent: any[] = [], jobs: Promise<unknown>[] = [];
+  let draft = "", id = 0;
+  const norm = (s: string) => s?.replace(/\s+/g, " ").trim();
+  const self: any = { addr, kind: "pi", piReader: reader, phase: "finding", files: [], pending: [], queue: [],
+    results: new Map(), opened: new Set(), box: { value: () => draft, set_value: (s: string) => { draft = s; } },
+    status: method("status"), saveSoon() {}, taskTags: () => '<hc task="7">brief</hc>\n',
+    sendIo: () => ({ hc: () => { throw new Error("Pi never types in the terminal"); } }),
+    settlePending: method("settlePending", { norm, same: (a: string, b: string) => norm(a) === norm(b), ownWords }),
+    recoverPiOutgoing: method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }),
+    piExec: async (_: string, args: string[], on: string, input: string) => {
+      sent.push({ args, on, ...JSON.parse(input) });
+      return json({ ok: true, status: "queued" });
+    },
+    deliver: method("deliver", { excerpt, norm, messageBody, refusal, sendTyped, piSend, piQuoteFor, piVisibleBody, samePiHistory,
+      attach: { deliver: async () => [] }, SETTLE: null }),
+  };
+  const cx = { notify() {}, timer: { after() {} }, sleep: async () => {}, spawn: (fn: Function) => jobs.push(fn(cx)) };
+  const pull = method("pull");
+  await pull.call(self, cx);
+  expect(self.conv.items[1].text).toBe(reply.text);
+  expect(self.status()).toBe("working");
+  const send = method("send", { piTarget, piQuoteFor, piRequestId: () => `steer-${++id}`, note() {},
+    mentions: { expand: (v: string) => v, expandTasks: (v: string) => v } });
+  for (let i = 0; i < 2; i++) {
+    draft = words;
+    self.quote = { text: reply.text, piHistory: piHistoryOf(active) };
+    send.call(self, cx);
+  }
+  await Promise.all(jobs);
+  expect(self.pending.map((p: any) => p.delivered)).toEqual([true, true]);
+  expect(sent).toEqual([1, 2].map((i) => ({ args: ["pi-chat", "send", "77"], on: "desktop-remote",
+    id: `steer-${i}`, body: tags + words, mode: "now", instance: active.instance, session: active.session, leaf: active.leaf, generation: active.generation })));
+  self.settlePending();
+  expect(self.pending.map((p: any) => p.msg.id)).toEqual(["steer-1", "steer-2"]);
+  items = [...items, { ...user, id: "different", text: "Do not say: please\ncontinue" }];
+  await pull.call(self, cx);
+  expect(self.pending.map((p: any) => p.msg.id)).toEqual(["steer-1", "steer-2"]);
+  items = [...items, { ...user, id: "consumed-1" }];
+  await pull.call(self, cx);
+  self.settlePending();
+  expect(self.pending.map((p: any) => p.msg.id)).toEqual(["steer-2"]);
+  items = [...items, { ...user, id: "consumed-2" }];
+  await pull.call(self, cx);
+  expect(self.pending).toEqual([]);
 });
 
 test("desktop paging keeps its anchor and drops a tool response from the previous Pi branch", async () => {
@@ -83,7 +141,7 @@ test("desktop held sends keep the old leaf; Send now steers and an unconfirmed s
     addr, kind: "pi", machine: "desktop-remote", phase: "ready", piReader: { pid: 77, pi: snapshot },
     queue: [], pending: [], asks: [{ stale: true }], status: () => "idle", saveSoon() {}, taskTags: () => "", sendIo: () => ({}),
     piExec: async (_: string, args: string[], on: string, input: string) => { sent.push({ args, on, ...JSON.parse(input) }); return answer; },
-    deliver: method("deliver", { messageBody, refusal, sendTyped, piSend, piQuoteFor, samePiHistory, PI_UNAVAILABLE,
+    deliver: method("deliver", { messageBody, refusal, sendTyped, piSend, piQuoteFor, piVisibleBody, samePiHistory, PI_UNAVAILABLE,
       attach: { deliver: async () => [] }, norm: (s: string) => s, SETTLE: null,
       openCard: () => { throw new Error("Pi does not use Claude or Codex's cards"); } }),
   };

@@ -1,5 +1,10 @@
 import { expect, test } from 'bun:test'
-import { keysTerm, termInPlace, termInput, touchScreen, typedInBox } from './shown.ts'
+import { keysTerm, tabCanChat, termInPlace, termInput, touchScreen, typedInBox } from './shown.ts'
+
+test('ordinary Pi, Claude and Codex tabs offer Chat / Terminal; shells do not', () => {
+  for (const cli of ['pi', 'claude', 'codex']) expect(tabCanChat(cli)).toBeTrue()
+  for (const cli of [undefined, 'bash', 'opencode']) expect(tabCanChat(cli)).toBeFalse()
+})
 
 // #786: a Claude Code or Codex tab switched to Chat kept showing its terminal: the Assistant's Chat | Terminal rule
 // matched it too, its chat key being its terminal

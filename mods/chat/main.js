@@ -31,7 +31,7 @@ import * as fs from "fs/promises";
 import { FIND, LOG, Conversation, records, resultText, summary, excerpt, names, pilotLine } from "./core/chat-log.js";
 import { BgJobs } from "./core/bg-jobs.js";
 import { ChatReader, kindOf } from "./core/chat-reader.js";
-import { piTarget, piSend, piRequestId, piHistoryOf, piQuoteFor, samePiHistory, PI_UNAVAILABLE, PI_BLOCKED } from "./core/pi-chat.js";
+import { piTarget, piSend, piRequestId, piHistoryOf, piQuoteFor, piVisibleBody, samePiHistory, PI_UNAVAILABLE, PI_BLOCKED } from "./core/pi-chat.js";
 import { preview } from "./core/recipe.js";
 import { words, howAnswered, codexOnScreen, codexSteps } from "./core/asks.js";
 // The rows' words and rules the web app's chat draws by too (core/chat-view.js).
@@ -1244,13 +1244,22 @@ export default class Chat extends View {
     // theirs, as sent from here (core/chat-view.js ownWords).
     for (const u of users) if (this.own?.has(u.id)) delete u.from;
     if (!this.pending?.length) return;
-    const matches = (u, p) => (u.at ?? 0) >= p.at - 5000 &&
-      (same(u.text, p.sent) || (p.match && norm(u.text).includes(p.match)) || (!p.match && u.images));
+    const matches = (u, p) => (u.at ?? 0) >= p.at - 5000 && (p.piPrior
+      ? p.piBody !== undefined && !p.piPrior.has(u.id) && u.piBody === p.piBody
+      : same(u.text, p.sent) || (p.match && norm(u.text).includes(p.match)) || (!p.match && u.images));
     for (const id of ownWords(users, this.pending, matches)) {
       (this.own ??= new Set()).add(id);
       delete users.find((u) => u.id === id).from;
     }
-    this.pending = this.pending.filter((p) => !users.some((u) => matches(u, p)));
+    // Pi's receipt is only an acknowledgement. A new user record can settle just one pending send,
+    // including across later polls when another send has identical words.
+    const consumed = new Set();
+    this.pending = this.pending.filter((p) => {
+      const u = users.find((u) => matches(u, p) && (!p.piPrior || !consumed.has(u.id)));
+      if (u && p.piPrior) consumed.add(u.id);
+      return !u;
+    });
+    for (const p of this.pending) if (p.piPrior) for (const id of consumed) p.piPrior.add(id);
   }
 
   // Unlike a dropped socket, a different Pi history can't acknowledge the old sends. Keep the
@@ -1565,6 +1574,7 @@ export default class Chat extends View {
     const p = { id: `pending-${msg.id}`, text: msg.text, replyTo: quote ? excerpt(quote.text, 80) : null, files: files.filter((f) => !f.image).map((f) => f.name),
       paths: files.filter((f) => f.image).map((f) => f.path), at: Date.now(), sent: body,
       match: norm(msg.text).slice(0, 60) || null, msg };
+    if (kind === "pi") p.piPrior = new Set();
     this.pending.push(p);
     const isSamePi = () => this.kind === "pi" && addr === msg.piAddr && this.addr === addr && this.piReader?.pid === msg.pi?.pid
       && samePiHistory(msg.pi, this.piReader?.pi);
@@ -1581,6 +1591,10 @@ export default class Chat extends View {
       try {
         const paths = await attach.deliver(files, addr, this.machine);
         p.sent = [body, ...paths].filter(Boolean).join("\n\n");
+        if (p.piPrior) {
+          for (const u of this.conv?.items ?? []) if (u.kind === "user") p.piPrior.add(u.id);
+          p.piBody = piVisibleBody(p.sent);
+        }
         // (a message with pictures: its Enter again if Claude Code lost it, sendTyped(); one that stayed in its box
         // last time gets only its Enter now, never typed twice)
         const io = this.sendIo(cx);

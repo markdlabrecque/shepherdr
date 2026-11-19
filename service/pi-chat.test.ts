@@ -1,10 +1,13 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { act } from "./actions.ts";
 import { Chats } from "./chats.ts";
 import { activity, Compat } from "./compat.ts";
+import { Live } from "./live.ts";
+import { piConversation } from "../core/chat-log.js";
+import { tabCanChat } from "../web/plugins/terminal/shown.ts";
 import type { Hub } from "./hub.ts";
 import { failedOf, forgetAll } from "./send-once.ts";
 import { piHistoryOf, PI_BLOCKED, PI_CHAT_CHANGED, PI_UNAVAILABLE, PI_UNCONFIRMED } from "../core/pi-chat.js";
@@ -40,7 +43,7 @@ function remote(read: (op: string, query: any) => unknown = () => snap, send: (r
       }
       const request = JSON.parse(Buffer.from(p.input, "base64").toString("utf8"));
       requests.push(request);
-      const result: any = send(request);
+      const result: any = await send(request);
       return out(result, result?.ok ? 0 : 1);
     },
   } as unknown as Hub;
@@ -55,12 +58,12 @@ const until = async (f: () => unknown) => {
 };
 
 test("read and send Pi chat on the qualified machine, with text only on stdin", async () => {
-  const { h, compat, calls, requests, notes } = remote(() => ({ ...snap, state: "blocked" }));
+  const { h, compat, calls, requests, notes } = remote(() => ({ ...snap, state: "working" }), () => ({ ok: true, status: "queued" }));
   const fake = join(root, "hc");
   const getLog = join(root, "get-args");
-  writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$@" > '${getLog}'\necho '{"foreground":{"pid":4242,"name":"pi"}}'\n`, { mode: 0o755 });
+  writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$@" > '${getLog}'\necho '{"foreground":{"pid":4242,"name":"node","argv":["/bin/pi"]}}'\n`, { mode: 0o755 });
   process.env.SHEPHERDR_HC = fake;
-  h.terminals.set(addr, { ...live, foreground: null } as any);
+  h.terminals.set(addr, { ...live, foreground: null, status: null } as any);
   const chats = new Chats(h);
   const page = () => {};
   try {
@@ -68,15 +71,16 @@ test("read and send Pi chat on the qualified machine, with text only on stdin", 
     await until(() => chats.reader(addr)?.pi);
     const reader = chats.reader(addr)!;
     expect(reader.conv!.items.map(({ id, text, at }: any) => ({ id, text, at }))).toEqual(snap.items.map(({ role, ...item }) => item));
-    expect(reader.pi.state).toBe("blocked");
     const chat = new Compat().chat(`t:${addr}`, reader, live);
-    expect(chat).toMatchObject({ cli: "pi", blocked: PI_BLOCKED, agent: { kind: "pi", words: "Pi" } });
+    expect(chat).toMatchObject({ cli: "pi", working: true, agent: { kind: "pi", words: "Pi" } });
     expect(chat.messages.map((m) => m.at)).toEqual(snap.items.map((m) => m.at));
     expect(await Bun.file(getLog).text()).toBe(`get\n${addr}\n--json\n`);
     const message = { type: "send", chat: `t:${addr}`, text: "/literal\n你好", cid: "pi-remote-1", human: true, piHistory: piHistoryOf(snap) };
     expect(await act(h, message, compat)).toHaveProperty("ok", true);
     expect(requests).toEqual([{ instance: "inst", session: "session", leaf: "r1", id: "pi-remote-1", body: "/literal\n你好", mode: "now" }]);
     expect(notes[0]).toMatchObject([addr, { cid: "pi-remote-1", text: message.text }]);
+    // A queued steering receipt is not a user message in Pi's conversation.
+    expect(new Compat().chat(`t:${addr}`, reader, live).messages.map((m) => m.text)).toEqual(["hi", "hello"]);
     expect(calls.every((p) => p.on === "pi-remote" && p.method === "machine.exec")).toBeTrue();
     expect(calls.find((p) => p.argv.at(-2) === "send").argv).toEqual(["sh", "-c", 'exec "$HOME/.local/bin/herdr-pi-chat" "$@"', "pi-chat", "send", "4242"]);
     for (const type of ["restart-info", "model-menu", "restart", "fork", "rewind"]) {
@@ -86,6 +90,136 @@ test("read and send Pi chat on the qualified machine, with text only on stdin", 
     chats.unwatch(addr, page);
     if (previous.hc === undefined) delete process.env.SHEPHERDR_HC; else process.env.SHEPHERDR_HC = previous.hc;
   }
+});
+
+function tabSnapshot(compat: Compat, terminal: { address: string }) {
+  (compat as any).terminalsOf = () => terminal;
+  return compat.snapshot({ host: "local", user: "Test", machines: [], sections: [], rows: [], spaces: [{
+    id: "pi-remote/sp1", name: "Test space", machine: "pi-remote", folder: "/repo",
+    tabs: [{ id: "tb1", terminals: [terminal.address] }],
+  } as any] });
+}
+
+test("selecting an ordinary remote terminal discovers Pi before its chat is watched", async () => {
+  const selected = "pi-remote/t42", term = `t:${selected}`;
+  const terminal = { address: selected, state: "live", created_ms: 42, argv: ["bash"], foreground: null, status: null };
+  const listeners: ((event: any) => void)[] = [];
+  const h = { terminals: new Map([[selected, terminal]]), on: (f: (event: any) => void) => listeners.push(f) } as unknown as Hub;
+  const compat = new Compat();
+  const wire = new Live(h, { on() {}, load: async () => ({}) } as any, () => null, "test");
+  wire.compat = compat;
+  wire.chats = new Chats(h);
+  const updates: any[] = [];
+  const ws = { data: {}, readyState: 1, getBufferedAmount: () => 0, send: (text: string) => updates.push(JSON.parse(text)) } as any;
+  wire.join(ws);
+  const tab = (t = terminal) => tabSnapshot(compat, t).places[0].tabs![0];
+  expect(tabCanChat(tab().cli)).toBeFalse();
+  const fake = join(root, "hc-discover"), getLog = join(root, "detect-args");
+  writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$@" > '${getLog}'\necho '{"foreground":{"pid":42,"name":"node","argv":["/bin/pi"]}}'\n`, { mode: 0o755 });
+  process.env.SHEPHERDR_HC = fake;
+  try {
+    let discovered: ReturnType<typeof tab> | undefined;
+    wire.onPiTab = () => {
+      const snapshot = tabSnapshot(compat, terminal);
+      discovered = snapshot.places[0].tabs![0];
+      wire.setSnapshot(snapshot);
+    };
+    // Terminal view sends only this selection, not a subscription to its chat.
+    wire.message(ws, JSON.stringify({ type: "watch", chats: [], term }));
+    await until(() => discovered);
+    expect(discovered).toMatchObject({ cli: "pi", term });
+    expect(tabCanChat(discovered?.cli)).toBeTrue();
+    expect(updates.find((m) => m.type === "snapshot").snapshot.places[0].tabs[0]).toMatchObject({ cli: "pi", term });
+    expect(await Bun.file(getLog).text()).toBe(`get\n${selected}\n--json\n`);
+    expect(tabCanChat(tab({ ...terminal, created_ms: 43 }).cli)).toBeFalse();
+    // An ordinary shell replacing Pi must not retain the previous switch on the same terminal.
+    const shellLog = join(root, "detected-shell");
+    writeFileSync(fake, `#!/bin/sh\necho '{"foreground":{"pid":43,"name":"bash"}}'\ntouch '${shellLog}'\n`);
+    discovered = undefined;
+    for (const on of listeners) on({ type: "foreground", terminal: selected });
+    await until(() => existsSync(shellLog));
+    expect(tabCanChat(tab().cli)).toBeFalse();
+    expect(discovered).toBeUndefined();
+  } finally {
+    wire.leave(ws);
+    if (previous.hc === undefined) delete process.env.SHEPHERDR_HC; else process.env.SHEPHERDR_HC = previous.hc;
+  }
+});
+
+test("web keeps a repeated Pi send pending until a new exact body appears", async () => {
+  const at = Date.now(), active = { ...snap, state: "working", generation: "g1" };
+  const old = { id: "old", role: "user", text: "continue", at: at - 10 };
+  const items = [old, { id: "reply", role: "assistant", text: "still working", at }];
+  let records = items;
+  const { h } = remote(() => ({ ...active, items: records }), () => ({ ok: true, status: "queued" }));
+  const compat = new Compat();
+  const key = tabSnapshot(compat, live).places[0].tabs![0].term;
+  const send = (cid: string) => act(h, { type: "send", chat: key, text: old.text, cid, pi: true, piHistory: piHistoryOf(active) }, compat);
+  const chat = () => compat.chat(key, { addr, kind: "pi", state: "ready", pi: active, conv: piConversation(records, active) }, live);
+  expect(await send("repeat-1")).toHaveProperty("ok", true);
+  expect(await send("repeat-2")).toHaveProperty("ok", true);
+  expect(chat().messages.map((m) => m.cid)).toEqual([undefined, undefined]);
+  records = [...records, { ...old, id: "different", text: '<hc reply-to="Different words"/>\ncontinue', at }, { ...old, id: "new-1", at }];
+  expect(chat().messages.map((m) => m.cid)).toEqual([undefined, undefined, undefined, "repeat-1"]);
+  // Even if the first confirmed row scrolls out of the loaded page, its CID can't move to the second row.
+  records = [{ ...old, id: "new-2", at }];
+  expect(chat().messages.map((m) => m.cid)).toEqual(["repeat-2"]);
+});
+
+test("web republishes Pi's normalized user row if the send receipt arrives after history", async () => {
+  let bridge = { ...snap, state: "working" };
+  let release!: () => void;
+  const receipt = new Promise<void>((resolve) => { release = resolve; });
+  const { h, requests } = remote(() => bridge, async () => { await receipt; return { ok: true, status: "queued" }; });
+  const compat = new Compat(), chats = new Chats(h);
+  compat.reader = (a) => chats.reader(a);
+  compat.onPiSend = (a) => chats.refresh(a);
+  const key = tabSnapshot(compat, live).places[0].tabs![0].term;
+  const published: ReturnType<Compat["chat"]>[] = [];
+  const page = (r: any, t: any) => published.push(compat.chat(key, r, t));
+  const message = { type: "send", chat: key, cid: "pi-late-receipt", text: "line one\r\n\x1b]0;terminal title\x07line two\u2066", piHistory: piHistoryOf(snap) };
+  let pending: ReturnType<typeof act> | undefined;
+  chats.watch(addr, page);
+  try {
+    await until(() => published.length);
+    pending = act(h, message, compat);
+    await until(() => requests.length);
+    expect(requests[0]).toMatchObject({ body: message.text, id: message.cid });
+    bridge = { ...bridge, items: [...snap.items, { id: "user", role: "user", text: "line one\nline two", at: Date.now() }] };
+    const last = () => published.at(-1)?.messages.at(-1);
+    await until(() => last()?.id === "user");
+    expect(last()?.cid).toBeUndefined();
+    release();
+    expect(await pending).toHaveProperty("ok", true);
+    expect(last()).toMatchObject({ id: "user", cid: message.cid, text: "line one\nline two" });
+  } finally { release(); await pending?.catch(() => {}); chats.unwatch(addr, page); }
+});
+
+test("web leaves Pi prompts in the terminal and reports a missing integration as unavailable", async () => {
+  let bridge: unknown = { ...snap, state: "blocked" };
+  const { h, compat, calls, requests, notes } = remote(() => bridge, () => ({ ok: false, error: "blocked" }));
+  const key = `t:${addr}`;
+  const chats = new Chats(h), pageCompat = new Compat();
+  const published: ReturnType<Compat["chat"]>[] = [];
+  const page = (r: any, t: any) => published.push(pageCompat.chat(key, r, t));
+  const latest = () => published.at(-1)!;
+  const send = { type: "send", chat: key, text: "yes", pi: true, piHistory: piHistoryOf(snap) };
+  chats.watch(addr, page);
+  try {
+    await until(() => published.length);
+    expect(latest()).toMatchObject({ cli: "pi", blocked: PI_BLOCKED, working: false });
+    expect(latest().messages.some((m) => m.question)).toBeFalse();
+    await expect(act(h, { ...send, cid: "pi-terminal-prompt" }, compat)).rejects.toThrow("Answer in the terminal");
+    expect(requests).toHaveLength(1);
+    bridge = { ok: false, error: "not_available" };
+    await until(() => latest().notice === "pi-unavailable");
+    expect(latest()).toMatchObject({ cli: "pi", notice: "pi-unavailable", messages: [], working: false });
+    expect(latest().blocked).toBeUndefined();
+    await expect(act(h, { ...send, cid: "pi-missing-bridge" }, compat)).rejects.toThrow(PI_UNAVAILABLE);
+    expect(requests).toHaveLength(1);
+    expect(notes).toEqual([]);
+    expect(calls.every((p) => p.method === "machine.exec" && ["snapshot", "send"].includes(p.argv[4]))).toBeTrue();
+  } finally { chats.unwatch(addr, page); }
 });
 
 test("web publishes Pi append, earlier, branch replacement and a revalidated reconnect", async () => {
@@ -172,14 +306,32 @@ test("a quoted web send is bound to the Pi snapshot the person saw", async () =>
   let active = { ...snap, generation: "new", session: "replacement" };
   const { h, compat, requests } = remote(() => active);
   compat.reader = (() => ({ kind: "pi", pi: original, conv: { items: [{ id: "old-quote", text: "only on the previous branch" }] } })) as any;
-  const b = { type: "send", chat: `t:${addr}`, pi: true, reply: "old-quote", text: "response", piHistory: piHistoryOf(original) };
+  compat.tasksFor = (() => [{ ref: "TASK-7", title: "Test task", state: "working", folder: "/repo", prompt: "task brief" }]) as any;
+  const b = { type: "send", chat: `t:${addr}`, pi: true, reply: "old-quote", text: "response for TASK-7", piHistory: piHistoryOf(original) };
   await expect(act(h, { ...b, cid: "cached-old-reply" }, compat)).rejects.toThrow(PI_CHAT_CHANGED);
   await expect(act(h, { ...b, cid: "wrong-view-reply", piHistory: piHistoryOf(active) }, compat)).rejects.toThrow(PI_CHAT_CHANGED);
   await expect(act(h, { ...b, cid: "unbound-reply", reply: undefined, piHistory: undefined }, compat)).rejects.toThrow(PI_CHAT_CHANGED);
   expect(requests).toEqual([]);
   active = original;
   expect(await act(h, { ...b, cid: "correct-reply" }, compat)).toHaveProperty("ok", true);
-  expect(requests[0]).toMatchObject({ session: original.session, generation: original.generation, body: expect.stringContaining("only on the previous branch") });
+  expect(requests[0]).toMatchObject({ session: original.session, generation: original.generation,
+    body: '<hc reply-to="only on the previous branch"/>\n<hc task="TASK-7" title="Test task" state="working" folder="/repo">task brief</hc>\nresponse for TASK-7' });
+});
+
+test("busy web Hold waits for Pi to settle even when terminal status says idle", async () => {
+  let state = "working";
+  const { h, compat, requests, notes } = remote(() => ({ ...snap, state }), () => ({ ok: true, status: state === "working" ? "waiting" : "accepted" }));
+  const message = { type: "send", chat: `t:${addr}`, cid: "pi-held-until-idle", text: "after the turn", hold: true, pi: true, piHistory: piHistoryOf(snap) };
+  expect(await act(h, message, compat)).toEqual({ ok: true, waiting: true, waitsFor: "turn" });
+  expect(requests[0]).toMatchObject({ id: message.cid, body: message.text, mode: "hold" });
+  await until(() => requests.length >= 2);
+  expect(notes).toEqual([]);
+  state = "idle";
+  await until(() => notes.length);
+  expect(requests).toEqual([requests[0], requests[0], requests[0]]);
+  expect(notes).toHaveLength(1);
+  expect(await act(h, message, compat)).toMatchObject({ ok: true });
+  expect(requests).toHaveLength(3);
 });
 
 test("held Pi send keeps its identity across polls and is not retried after a lost receipt", async () => {

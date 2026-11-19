@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { expire, KEEP_PAST, loadOutbox, partsOf, settle, unconfirmedPi, type Outgoing } from './outbox.ts'
-import type { Chat } from '@shared/types.ts'
+import type { Chat, Message } from '@shared/types.ts'
 
 // What you sent comes back from the agent's log without its id: it takes the pending one's place by its words, files
 // and time, by the server's clock against the log's (the agent may be on another machine).
@@ -14,6 +14,14 @@ test('a Pi send without a receipt keeps its words and no Retry, even after expir
   expect(expire([sending], 12 * 60_000)).toEqual([failed])
   expect(settle([failed], { ...chat([]), cli: 'pi', failed: [{ cid: 'c1', error: 'Pi changed branches.', noRetry: true }] })[0])
     .toMatchObject({ state: 'failed', error: 'Pi changed branches.', noRetry: true, ambiguous: undefined })
+})
+
+test('Pi stays pending when the same displayed words lack its request ID', () => {
+  const o = sent({ pi: true, piHistory: 'viewed' })
+  const m: Message = { id: 'different-body', who: 'you', text: o.text, at: 10_800 }
+  const view: Chat = { ...chat([m]), cli: 'pi', piHistory: 'viewed' }
+  expect(settle([o], view)).toEqual([o])
+  expect(settle([o], { ...view, messages: [{ ...m, cid: o.cid }] })).toEqual([])
 })
 
 test('a pending Pi send is recoverable but never displayed or settled on a different branch', () => {

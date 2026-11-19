@@ -23,6 +23,13 @@ const refusals = {
 export const piMachine = (addr) => addr.includes("/") ? addr.split("/")[0] : null;
 export const piRequestId = () => `shep-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
+// Match the bridge's cleanText projection when comparing a submission to a stored user row.
+// The desktop JS runtime lacks node:util, so use the same VT forms as stripVTControlCharacters.
+const VT = /\x1b\][\s\S]*?(?:\x07|\x1b\\|\x9c)|[\x1b\x9b][[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]/g;
+export const piVisibleBody = (s) => s.replace(VT, "").replace(/\r\n?/g, "\n")
+  .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, "")
+  .replace(/[\ud800-\udfff]/gu, "\ufffd");
+
 async function piRead(sh, addr, pid, op, query) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   try {

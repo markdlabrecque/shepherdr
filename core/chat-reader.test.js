@@ -1,5 +1,13 @@
 import { expect, test } from "bun:test";
-import { ChatReader } from "./chat-reader.js";
+import { ChatReader, kindOf } from "./chat-reader.js";
+
+test("a Node-launched Pi is a chat agent even without its app status", () => {
+  expect(kindOf({ foreground: { name: "node", argv: ["/bin/pi"] } })).toBe("pi");
+  expect(kindOf({ foreground: { name: "node", argv: ["node", "pi"] } })).toBeNull();
+  expect(kindOf({ argv: ["pi"], foreground: { name: "bash", argv: ["bash"] } })).toBeNull();
+  expect(kindOf({ status: { app: "claude-code" }, foreground: { name: "node" } })).toBe("claude");
+  expect(kindOf({ foreground: { name: "codex" } })).toBe("codex");
+});
 
 const addr = "pi-box/t4";
 const terminal = { state: "live", foreground: { name: "pi", pid: 73 } };
