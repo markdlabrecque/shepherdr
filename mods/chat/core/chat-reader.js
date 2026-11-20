@@ -36,6 +36,7 @@ export class ChatReader {
     this.piView = null;
     this.piFresh = true;
     this.piOffline = false;
+    this.piIdentityUnknown = false;
     this.piGap = null;
     this.piBarrier = {};
     this.piReadSeq = 0;
@@ -64,7 +65,15 @@ export class ChatReader {
     if (this.pinned) return false;
     const kind = kindOf(t);
     const pid = t?.foreground?.pid;
-    if (kind === "pi" && t?.state !== "ended") {
+    if (this.kind === "pi" && this.pid && t?.state === "live" && !pid && (kind === "pi" || !t.foreground?.name)) {
+      // A reconnect can remove the foreground record before hc get fills it back in.
+      // Do not poll the old PID or throw away its window while identity is unknown.
+      if (!this.piIdentityUnknown) this.refreshPi();
+      this.piIdentityUnknown = true;
+      return false;
+    }
+    this.piIdentityUnknown = false;
+    if (kind === "pi" && t?.state !== "ended" && t?.state !== "finished") {
       if (this.kind === "pi" && this.pid === pid) return false;
       this.reset();
       this.kind = kind;
@@ -125,8 +134,18 @@ export class ChatReader {
   refreshPi() {
     this.piFresh = true;
     this.piOffline = false;
-    this.piGap = null;
     this.piBarrier = {};
+    // The loaded rows and any gap pages are already verified under this.pi's generation.
+    // A transport failure does not invalidate them; a new history will discard them.
+  }
+
+  suspendPi() {
+    if (!this.pi || this.piOffline) return false;
+    this.refreshPi();
+    this.piOffline = true;
+    this.pi = { ...this.pi, live: [] };
+    this.rebuildPi();
+    return true;
   }
 
   rebuildPi() {
@@ -149,22 +168,14 @@ export class ChatReader {
   }
 
   async pullPi() {
+    if (this.piIdentityUnknown) return this.suspendPi();
     const barrier = this.piBarrier, seq = ++this.piReadSeq;
     const current = () => this.piBarrier === barrier && this.piReadSeq === seq;
     const previous = this.piFresh ? null : this.pi;
     const validDelta = (s) => samePiHistory(previous, s) && s.before === this.piEnd;
     let next = await piSnapshot(this.io.sh, this.addr, this.pid, previous, true);
     if (!current()) return false;
-    if (next?.error === "transport" && this.pi) {
-      if (this.piOffline) return false;
-      // Leave verified rows and their scroll identity in place, but discard provisional text
-      // and stop side reads. Reconnect with a full snapshot before admitting any new data.
-      this.refreshPi();
-      this.piOffline = true;
-      this.pi = { ...this.pi, live: [] };
-      this.rebuildPi();
-      return true;
-    }
+    if (next?.error === "transport" && this.pi) return this.suspendPi();
     if (previous && (next?.error === "stale_revision" || (next?.reset === false && !validDelta(next)))) {
       this.refreshPi();
       return this.pullPi();
@@ -173,7 +184,7 @@ export class ChatReader {
     if (!next) {
       if (this.state === "unavailable") return false;
       this.refreshPi();
-      this.pi = this.piView = this.piVersion = this.piEnd = this.start = this.conv = null;
+      this.pi = this.piView = this.piVersion = this.piEnd = this.piGap = this.start = this.conv = null;
       this.piItems = [];
       this.state = "unavailable";
       return true;

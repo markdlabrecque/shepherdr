@@ -1155,6 +1155,10 @@ export default class Chat extends View {
     if (!this.thread && !this.inner && !this.swapping && !t.labels?.["herdr.chat"] && pane && !panes().some((p) => p.terminal === this.addr)
       && panes().some((p) => p.pane === pane && p.mod === "chat")) await hc(["label", this.addr, `herdr.chat=${chatLabel(pane)}`]);
     const kind = kindOf(t);
+    if (!kind && this.piReader?.addr === this.addr && t.state === "live" && !t.foreground?.name && !t.foreground?.pid) {
+      await this.piReader.locate(t);
+      return;
+    }
     // Back at its shell because the session it resumed is gone: a new agent starts there.
     if (!kind) {
       this.piReader = null;

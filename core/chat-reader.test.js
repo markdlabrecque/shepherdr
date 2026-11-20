@@ -32,19 +32,19 @@ function rig() {
   return { reader, take, pull };
 }
 
-test("Pi loss and reconnect replace the conversation, even with the same PID and session", async () => {
+test("temporary Pi bridge loss keeps verified rows until the replacement is confirmed", async () => {
   const { reader, take, pull } = rig();
   await reader.locate(terminal);
   await pull(snap({ items: [row("1:0", "previous branch")] }));
-  expect(texts(reader)).toEqual(["previous branch"]);
   const view = reader.piView;
   await pull({ ok: false, error: "not_available" });
-  expect(reader.state).toBe("unavailable");
-  expect(reader.conv).toBeNull();
+  expect(reader.piOffline).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["previous branch"]);
   const pending = reader.pull();
   const call = take("snapshot");
   expect(call.query).toBeUndefined();
-  call.reply(snap({ items: [row("2:0", "after reconnect")] }));
+  call.reply(snap({ instance: "restarted", items: [row("2:0", "after reconnect")] }));
   expect(await pending).toBeTrue();
   expect(reader.piView).not.toBe(view);
   expect(texts(reader)).toEqual(["after reconnect"]);
@@ -158,7 +158,7 @@ test("a wide compaction can recover a small gap without losing the loaded window
   expect(texts(reader)).toEqual(["original turn", "A summary continues"]);
 });
 
-test("a large same-branch gap is recovered across polls without replacing the rendered view", async () => {
+test("a large same-branch gap is recovered across intermittent timeouts without replacing the rendered view", async () => {
   const { reader, take, pull } = rig();
   await reader.locate(terminal);
   await pull(snap({ items: [row("first:0", "original turn")], state: "working" }));
@@ -178,8 +178,11 @@ test("a large same-branch gap is recovered across polls without replacing the re
   expect(reader.pi.state).toBe("idle");
   expect(reader.piView).toBe(view);
   expect(texts(reader)).toEqual(["original turn"]);
+  expect(await pull({ ok: false, error: "timeout" })).toBeTrue();
   const second = reader.pull();
-  take("snapshot").reply(latest);
+  const revalidate = take("snapshot");
+  expect(revalidate.query).toBeUndefined();
+  revalidate.reply(latest);
   await page(2, "first");
   expect(await second).toBeTrue();
   expect(reader.piView).toBe(view);

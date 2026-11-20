@@ -31,7 +31,7 @@ test("the window pulls a qualified Pi snapshot and uses its status, not the term
   expect(self.conv.items[0]).toMatchObject({ id: "msg", text: "Hello", at: 1234 });
   expect(method("status").call(self)).toBe("blocked");
   expect(method("asking", { PI_BLOCKED }).call(self)).toBe(PI_BLOCKED);
-  answer = json({ ok: false, error: "not_available" }, 1);
+  answer = json({ ok: false, error: "unsafe_registry" }, 1);
   await pull.call(self, { notify: () => changed.push(1) });
   expect(self.phase).toBe("pi-unavailable");
   expect(changed).toHaveLength(2);

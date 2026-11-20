@@ -211,7 +211,7 @@ test("web leaves Pi prompts in the terminal and reports a missing integration as
     expect(latest().messages.some((m) => m.question)).toBeFalse();
     await expect(act(h, { ...send, cid: "pi-terminal-prompt" }, compat)).rejects.toThrow("Answer in the terminal");
     expect(requests).toHaveLength(1);
-    bridge = { ok: false, error: "not_available" };
+    bridge = { ok: false, error: "unsafe_registry" };
     await until(() => latest().notice === "pi-unavailable");
     expect(latest()).toMatchObject({ cli: "pi", notice: "pi-unavailable", messages: [], working: false });
     expect(latest().blocked).toBeUndefined();
@@ -329,6 +329,44 @@ test("a core reconnect fences the old in-flight Pi overlay before publishing aga
     expect(queries[2]).toBeUndefined();
     expect(published).toEqual([["hi", "hello"], ["New session"]]);
   } finally { chats.unwatch(addr, page); }
+});
+
+test("a transient missing foreground after core reset keeps the verified Pi view", async () => {
+  const first = { ...snap, generation: "g1", reset: true, before: 1, live: [] };
+  const { h } = remote((op) => op === "page" ? { ...first, before: 0, items: [
+    { id: "history", role: "assistant", text: "Loaded earlier", at: 42 },
+  ] } : first);
+  const fake = join(root, "hc-missing-foreground");
+  writeFileSync(fake, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  const saved = process.env.SHEPHERDR_HC;
+  process.env.SHEPHERDR_HC = fake;
+  let emit: (event: { type: "reset" }) => void = () => {};
+  h.on = (cb) => { emit = cb; return () => true; };
+  const chats = new Chats(h), compat = new Compat();
+  const published: ReturnType<Compat["chat"]>[] = [];
+  const page = (r: any, t: any) => published.push(compat.chat(`t:${addr}`, r, t));
+  const latest = () => published.at(-1)!;
+  chats.watch(addr, page);
+  try {
+    await until(() => published.length);
+    const view = latest().piView;
+    await chats.earlier(addr, view);
+    const reads = published.length;
+    h.terminals.set(addr, { ...live, foreground: null } as any);
+    emit({ type: "reset" });
+    await until(() => published.length > reads);
+    expect(latest()).toMatchObject({ piView: view, top: true });
+    expect(latest().messages.map((m) => m.text)).toEqual(["Loaded earlier", "hi", "hello"]);
+    const interrupted = published.length;
+    h.terminals.set(addr, live as any);
+    emit({ type: "reset" });
+    await until(() => published.length > interrupted);
+    expect(latest().piView).toBe(view);
+    expect(latest().messages.map((m) => m.text)).toEqual(["Loaded earlier", "hi", "hello"]);
+  } finally {
+    chats.unwatch(addr, page);
+    if (saved === undefined) delete process.env.SHEPHERDR_HC; else process.env.SHEPHERDR_HC = saved;
+  }
 });
 
 test("web removes an interrupted overlay without resetting the scroller or publishing to a new watcher", async () => {

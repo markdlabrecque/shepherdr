@@ -39,7 +39,7 @@ async function piRead(sh, addr, pid, op, query) {
     if (r.code === 127) return null; // The helper itself is missing.
     const s = JSON.parse(r.stdout);
     if (s?.error === "stale_revision") return s;
-    if (op === "snapshot" && (s?.error === "timeout" || s?.error === "ipc_error")) return { error: "transport" };
+    if (op === "snapshot" && ["timeout", "ipc_error", "not_available"].includes(s?.error)) return { error: "transport" };
     if (r.code === 0 && s?.ok && typeof s.instance === "string" && typeof s.session === "string") return s;
   } catch { if (op === "snapshot") return { error: "transport" }; }
   return null;

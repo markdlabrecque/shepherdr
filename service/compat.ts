@@ -728,7 +728,8 @@ export class Compat {
     const under = st === "working" ? { doing: CV.doingWords(reader.conv, report) ?? "", ...(reader.conv?.waiting ? { waits: true } : {}) }
       : st === "blocked" && !cards ? { blocked: report.replace(/^answer:\s*/i, "") } : {};
     // a note under the conversation (a lost session being started again: service/watch.ts)
-    const note = pi && st === "error" ? "Pi reported an error. Check the terminal." : addr ? watch?.notes?.get(addr)?.text : undefined;
+    const note = pi && reader.piOffline ? "Pi chat is reconnecting." : pi && st === "error" ? "Pi reported an error. Check the terminal."
+      : addr ? watch?.notes?.get(addr)?.text : undefined;
     // instead of the conversation, the window's notice: still opening, not a chat agent, its log not found, ended
     const kind = kindOfTerm(t);
     const notice = reader.state === "unavailable" ? "pi-unavailable" : !reader.conv && (reader.state === "finding" || reader.state === "pending") ? "opening"
