@@ -35,6 +35,8 @@ export class ChatReader {
     this.piEnd = null;
     this.piView = null;
     this.piFresh = true;
+    this.piOffline = false;
+    this.piGap = null;
     this.piBarrier = {};
     this.piReadSeq = 0;
     this.start = null;   // the first byte read (0: the log's very start)
@@ -122,6 +124,8 @@ export class ChatReader {
 
   refreshPi() {
     this.piFresh = true;
+    this.piOffline = false;
+    this.piGap = null;
     this.piBarrier = {};
   }
 
@@ -149,13 +153,23 @@ export class ChatReader {
     const current = () => this.piBarrier === barrier && this.piReadSeq === seq;
     const previous = this.piFresh ? null : this.pi;
     const validDelta = (s) => samePiHistory(previous, s) && s.before === this.piEnd;
-    let next = await piSnapshot(this.io.sh, this.addr, this.pid, previous);
+    let next = await piSnapshot(this.io.sh, this.addr, this.pid, previous, true);
     if (!current()) return false;
+    if (next?.error === "transport" && this.pi) {
+      if (this.piOffline) return false;
+      // Leave verified rows and their scroll identity in place, but discard provisional text
+      // and stop side reads. Reconnect with a full snapshot before admitting any new data.
+      this.refreshPi();
+      this.piOffline = true;
+      this.pi = { ...this.pi, live: [] };
+      this.rebuildPi();
+      return true;
+    }
     if (previous && (next?.error === "stale_revision" || (next?.reset === false && !validDelta(next)))) {
       this.refreshPi();
       return this.pullPi();
     }
-    if (next?.error === "stale_revision" || (next?.generation && next.reset === false && !previous)) next = null;
+    if (next?.error || (next?.generation && next.reset === false && !previous)) next = null;
     if (!next) {
       if (this.state === "unavailable") return false;
       this.refreshPi();
@@ -165,28 +179,40 @@ export class ChatReader {
       return true;
     }
     const snapshot = !next.generation || next.reset !== false;
+    if (snapshot && this.piItems.length && next.generation && samePiHistory(this.pi, next) && next.before > this.piEnd) {
+      // Page backwards from a fixed target, even if the tail keeps growing. Bound the work
+      // per poll without throwing away the anchor or repeatedly copying the backlog.
+      const gap = this.piGap ?? { target: next, before: next.before, pages: [] };
+      for (let remaining = 2; remaining > 0 && gap.before > this.piEnd; remaining--) {
+        const page = await piPage(this.io.sh, this.addr, this.pid, next.generation, gap.before);
+        if (!current() || (page && !this.acceptsPiReply(page, barrier))) return false;
+        if (!piPageEndsAt(page, gap.before)) break;
+        gap.pages.push(page.items);
+        gap.before = page.before;
+      }
+      if (gap.before > this.piEnd) {
+        this.piGap = gap;
+        // Only the state is current while a gap separates these rows from the live tail.
+        const changed = this.piFresh || this.pi.state !== next.state || !!this.pi.live?.length;
+        this.pi = { ...this.pi, state: next.state, live: [] };
+        this.piFresh = this.piOffline = false;
+        if (changed) this.rebuildPi();
+        return changed;
+      }
+      next = { ...gap.target, before: gap.before, items: [...gap.pages.reverse().flat(), ...gap.target.items],
+        state: next.state, live: gap.target.leaf === next.leaf ? next.live : [] };
+    }
+    this.piGap = null;
     const version = JSON.stringify([next.instance, next.session, next.leaf, next.generation, next.state, next.live]);
     if (next.generation) {
       if (!snapshot && !next.items.length && version === this.piVersion) return false;
     } else if (JSON.stringify(next) === this.piVersion && !this.piFresh) return false;
     if (snapshot) {
-      let window = next;
-      if (this.piItems.length && samePiHistory(this.pi, next) && next.generation) {
-        // A wide compaction summary or a burst of output can push the newest page past
-        // the loaded history. Bridge a small gap to keep scroll anchors, but never fetch
-        // an unbounded backlog on reconnect: a large gap remains available via Earlier.
-        for (let remaining = 2; remaining > 0 && window.before > this.piEnd; remaining--) {
-          const page = await piPage(this.io.sh, this.addr, this.pid, next.generation, window.before);
-          if (!current() || (page && !this.acceptsPiReply(page, barrier))) return false;
-          if (!piPageEndsAt(page, window.before)) break;
-          window = { ...window, before: page.before, items: [...page.items, ...window.items] };
-        }
-      }
-      const keep = piCanKeepWindow(this.pi, this.start, this.piEnd, this.piItems, window);
+      const keep = piCanKeepWindow(this.pi, this.start, this.piEnd, this.piItems, next);
       if (keep) {
-        const prefix = this.piItems.slice(0, Math.max(0, window.before - this.start));
-        this.piItems = [...prefix, ...window.items];
-        this.start = window.before - prefix.length;
+        const prefix = this.piItems.slice(0, Math.max(0, next.before - this.start));
+        this.piItems = [...prefix, ...next.items];
+        this.start = next.before - prefix.length;
       } else {
         this.piBarrier = {};
         this.piView = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -195,7 +221,7 @@ export class ChatReader {
       }
     } else if (next.items.length) this.piItems.push(...next.items);
     this.piEnd = next.generation ? next.before + next.items.length : null;
-    this.piFresh = false;
+    this.piFresh = this.piOffline = false;
     this.piVersion = next.generation ? version : JSON.stringify(next);
     this.pi = next;
     this.state = "ready";

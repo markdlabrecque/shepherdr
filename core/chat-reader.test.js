@@ -158,6 +158,55 @@ test("a wide compaction can recover a small gap without losing the loaded window
   expect(texts(reader)).toEqual(["original turn", "A summary continues"]);
 });
 
+test("a large same-branch gap is recovered across polls without replacing the rendered view", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  await pull(snap({ items: [row("first:0", "original turn")], state: "working" }));
+  const view = reader.piView;
+  const latest = snap({ before: 4, leaf: "summary", items: [row("summary:0", "summary", "compaction")] });
+  const page = async (cursor, text) => {
+    await Bun.sleep(0);
+    const request = take("page");
+    expect(request.query.before).toBe(cursor);
+    request.reply(snap({ before: cursor - 1, items: [row(`gap-${cursor}:0`, text)] }));
+  };
+  const first = reader.pull();
+  take("snapshot").reply(latest);
+  await page(4, "third");
+  await page(3, "second");
+  expect(await first).toBeTrue();
+  expect(reader.pi.state).toBe("idle");
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["original turn"]);
+  const second = reader.pull();
+  take("snapshot").reply(latest);
+  await page(2, "first");
+  expect(await second).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["original turn", "first", "second", "third", "summary"]);
+});
+
+test("a brief transport timeout keeps verified history and recovers without the old overlay", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  const latest = snap({ before: 1, state: "working", items: [row("new:0", "current")], live: [row("live:r:0", "old stream")] });
+  await pull(latest);
+  const view = reader.piView;
+  const pending = reader.earlier(view);
+  take("page").reply(snap({ items: [row("old:0", "earlier")] }));
+  expect(await pending).toBeTrue();
+  expect(await pull({ ok: false, error: "timeout" })).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["earlier", "current"]);
+  const retry = reader.pull();
+  const request = take("snapshot");
+  expect(request.query).toBeUndefined();
+  request.reply({ ...latest, state: "idle", live: [] });
+  expect(await retry).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["earlier", "current"]);
+});
+
 test("an explicitly expired snapshot cursor retries without a cursor", async () => {
   const { reader, take, pull } = rig();
   await reader.locate(terminal);

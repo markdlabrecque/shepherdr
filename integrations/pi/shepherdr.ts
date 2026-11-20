@@ -148,7 +148,7 @@ function fileMark(path: string | undefined, old?: ReturnType<typeof fileStamp>) 
   } catch { return { stamp: undefined, replaced: Boolean(old) }; }
 }
 
-function fileStamp(path: string, old?: { identity: string; size: number; changed: bigint; head: Buffer; tail: Buffer }) {
+function fileStamp(path: string, old?: { identity: string; size: number; changed: bigint; digest: string }) {
   const info = statSync(path, { bigint: true });
   if (!info.isFile()) throw new Error("Not a session file");
   const identity = `${info.dev}:${info.ino}:${info.birthtimeNs}`;
@@ -158,17 +158,29 @@ function fileStamp(path: string, old?: { identity: string; size: number; changed
   const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
     const opened = fstatSync(fd, { bigint: true });
-    if (`${opened.dev}:${opened.ino}:${opened.birthtimeNs}` !== identity || !opened.isFile()) throw new Error("Session file changed");
-    const sample = (length: number, offset: number) => {
-      const buf = Buffer.alloc(length);
-      if (readSync(fd, buf, 0, length, offset) !== length) throw new Error("Session file truncated");
-      return buf;
+    if (`${opened.dev}:${opened.ino}:${opened.birthtimeNs}` !== identity || !opened.isFile() || opened.size !== info.size
+        || opened.ctimeNs !== changed) throw new Error("Session file changed");
+    // Unchanged metadata never needs a read. On growth, verify every old byte: a truncate
+    // and rewrite can grow the same inode and preserve both ends of the former file.
+    const hash = createHash("sha256"), buf = Buffer.allocUnsafe(64 * 1024);
+    let offset = 0;
+    const hashThrough = (end: number) => {
+      while (offset < end) {
+        const count = readSync(fd, buf, 0, Math.min(buf.length, end - offset), offset);
+        if (!count) throw new Error("Session file truncated");
+        hash.update(buf.subarray(0, count));
+        offset += count;
+      }
     };
-    const length = Math.min(size, 128);
-    const head = sample(length, 0), tail = sample(length, size - length);
-    const append = !!old && identity === old.identity && size > old.size && head.subarray(0, old.head.length).equals(old.head)
-      && sample(old.tail.length, old.size - old.tail.length).equals(old.tail);
-    return { identity, size, changed, head, tail, append };
+    let append = false;
+    if (old && identity === old.identity && size > old.size) {
+      hashThrough(old.size);
+      append = hash.copy().digest("hex") === old.digest;
+    }
+    hashThrough(size);
+    const verify = fstatSync(fd, { bigint: true });
+    if (verify.size !== info.size || verify.ctimeNs !== changed) throw new Error("Session file changed");
+    return { identity, size, changed, digest: hash.digest("hex"), append };
   } finally { closeSync(fd); }
 }
 

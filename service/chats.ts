@@ -211,7 +211,9 @@ export class Chats {
   }
 
   private publish(addr: string, f: Followed) {
-    if (f.reader.kind === "pi" && f.reader.piFresh && f.reader.state !== "unavailable") return;
+    // Existing pages may replace an interrupted overlay with the last verified rows.
+    // Newly joined pages stay in `awaiting` until a snapshot has been revalidated.
+    if (f.reader.kind === "pi" && f.reader.piFresh && !f.reader.piOffline && f.reader.state !== "unavailable") return;
     f.ready = true;
     const t = this.hub.terminals.get(addr);
     for (const page of f.pages) if (!f.awaiting?.has(page)) page(f.reader, t);

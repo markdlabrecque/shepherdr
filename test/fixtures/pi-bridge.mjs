@@ -119,6 +119,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     renameSync(`${file}.tmp`, file);
   }
   if (action === "rewrite-file") writeFileSync(file, readFileSync(file, "utf8").replace("reply", "other"));
+  if (action === "regrow-file") writeFileSync(file, readFileSync(file, "utf8").replace("reply", "other") + "\n");
   if (action === "truncate-file") truncateSync(file, 5);
   if (action === "replace-leaf-entry") {
     const prior = entries.get(leaf);

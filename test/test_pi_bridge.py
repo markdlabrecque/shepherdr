@@ -359,6 +359,20 @@ class Bridge(Scratch):
             ("compaction", "what happened before compaction"), ("branch", "why this branch exists"),
         ])
 
+    def test_same_inode_truncation_and_regrowth_fences_old_cursors(self):
+        path = self.runtime.parent / "regrown.jsonl"
+        self.control("file", str(path))
+        self.control("wide")
+        first = self.cli("snapshot")
+        identity = path.stat()
+        self.control("regrow-file")
+        self.assertEqual(path.stat().st_ino, identity.st_ino)
+        self.assertGreater(path.stat().st_size, identity.st_size)
+        moved = self.cli("snapshot", self.cursor(first))
+        self.assertTrue(moved["reset"])
+        self.assertNotEqual(moved["generation"], first["generation"])
+        self.assertEqual(self.cli("page", {"generation": first["generation"], "before": first["before"]})["error"], "stale_revision")
+
     def test_ephemeral_branch_detects_replaced_entries_even_with_same_leaf(self):
         self.control("leaf", "assistant-1")
         first = self.cli("snapshot")

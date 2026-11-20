@@ -1539,7 +1539,7 @@ export default class Chat extends View {
 
   // A held message goes once the agent stops working (and isn't asking something).
   drainQueue(cx) {
-    if (!this.queue.length || this.phase !== "ready") return;
+    if (!this.queue.length || this.phase !== "ready" || (this.kind === "pi" && this.piReader?.piFresh)) return;
     const st = this.status();
     if (st === "working" || st === "blocked" || (this.kind !== "pi" && (this.asks.length || openCard(this.addr))) || this.pending.some((p) => !p.failed && !p.late)) return;
     const msg = this.queue.shift();

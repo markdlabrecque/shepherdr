@@ -36,16 +36,18 @@ async function piRead(sh, addr, pid, op, query) {
     const args = ["pi-chat", op, String(pid)];
     if (query) args.push(JSON.stringify(query));
     const r = await sh(PI_CLIENT, args, piMachine(addr));
+    if (r.code === 127) return null; // The helper itself is missing.
     const s = JSON.parse(r.stdout);
     if (s?.error === "stale_revision") return s;
+    if (op === "snapshot" && (s?.error === "timeout" || s?.error === "ipc_error")) return { error: "transport" };
     if (r.code === 0 && s?.ok && typeof s.instance === "string" && typeof s.session === "string") return s;
-  } catch {}
+  } catch { if (op === "snapshot") return { error: "transport" }; }
   return null;
 }
 
-export async function piSnapshot(sh, addr, pid, cursor) {
+export async function piSnapshot(sh, addr, pid, cursor, reportFailure = false) {
   const s = await piRead(sh, addr, pid, "snapshot", cursor?.generation ? { generation: cursor.generation, leaf: cursor.leaf } : null);
-  if (s?.error === "stale_revision") return s;
+  if (s?.error) return reportFailure ? s : null;
   return s && ["idle", "working", "blocked", "error"].includes(s.state) && Array.isArray(s.items)
     && (s.leaf === null || typeof s.leaf === "string")
     && (!s.generation || (Number.isSafeInteger(s.before) && s.before >= 0)) ? s : null;
@@ -54,8 +56,8 @@ export const piPage = (sh, addr, pid, generation, before) => piRead(sh, addr, pi
 export const piResults = (sh, addr, pid, generation, ids) => piRead(sh, addr, pid, "results", { generation, ids });
 export const samePiHistory = (a, b) => a && b && a.instance === b.instance && a.session === b.session && a.generation === b.generation;
 
-// A reset can mean the append cursor expired, not that the branch changed. Preserve a contiguous
-// loaded prefix. If there's a gap, use the new window and leave everything before it paginated.
+// A reset can mean the append cursor expired, not that the branch changed. Reuse a loaded
+// prefix only if the replacement is contiguous and agrees on any overlapping entry blocks.
 export function piCanKeepWindow(current, start, end, rows, next) {
   if (!current?.generation || !samePiHistory(current, next) || next.before > end
       || next.before + next.items.length < end) return false;

@@ -331,6 +331,31 @@ test("a core reconnect fences the old in-flight Pi overlay before publishing aga
   } finally { chats.unwatch(addr, page); }
 });
 
+test("web removes an interrupted overlay without resetting the scroller or publishing to a new watcher", async () => {
+  const first = { ...snap, generation: "g1", reset: true, before: 0, state: "working",
+    live: [{ id: "live:old:0", role: "assistant", text: "Old overlay", at: 43 }] };
+  let bridge: Record<string, unknown> = first;
+  const { h } = remote(() => bridge);
+  const chats = new Chats(h), compat = new Compat();
+  const existing: ReturnType<Compat["chat"]>[] = [], joined: ReturnType<Compat["chat"]>[] = [];
+  const a = (r: any, t: any) => existing.push(compat.chat(`t:${addr}`, r, t));
+  const b = (r: any, t: any) => joined.push(compat.chat(`t:${addr}`, r, t));
+  chats.watch(addr, a);
+  try {
+    await until(() => !!existing.at(-1)?.messages.some((m) => m.provisional));
+    const view = existing.at(-1)!.piView;
+    bridge = { ok: false, error: "timeout" };
+    await until(() => existing.length > 1);
+    expect(existing.at(-1)).toMatchObject({ piView: view, working: true });
+    expect(existing.at(-1)?.messages.map((m) => m.text)).toEqual(["hi", "hello"]);
+    chats.watch(addr, b);
+    expect(joined).toHaveLength(0);
+    bridge = { ...first, state: "idle", live: [] };
+    await until(() => joined.length);
+    expect(joined[0]).toMatchObject({ piView: view, working: false });
+  } finally { chats.unwatch(addr, a); chats.unwatch(addr, b); }
+});
+
 test("a quoted web send is bound to the Pi snapshot the person saw", async () => {
   const original = { ...snap, generation: "old", session: "previous", reset: true, before: 0, live: [] };
   let active = { ...original, generation: "new", session: "replacement" };
