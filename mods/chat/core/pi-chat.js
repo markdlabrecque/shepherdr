@@ -9,6 +9,7 @@ const refusals = {
   stale_instance: "Pi restarted before this message could be sent. Check the terminal before writing a new message.",
   stale_session: "Pi switched sessions before this message could be sent. Check the terminal before writing a new message.",
   stale_leaf: "Pi changed branches before this message could be sent. Check the terminal before writing a new message.",
+  stale_view: "Pi could not confirm the open conversation. Your message was not sent.",
   not_available: PI_UNAVAILABLE,
   unsafe_runtime: PI_UNAVAILABLE,
   unsafe_registry: PI_UNAVAILABLE,

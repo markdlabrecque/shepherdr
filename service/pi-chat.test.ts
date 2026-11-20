@@ -369,7 +369,7 @@ test("a transient missing foreground after core reset keeps the verified Pi view
   }
 });
 
-test("web removes an interrupted overlay without resetting the scroller or publishing to a new watcher", async () => {
+test("web keeps verified history in place and gives new watchers an empty unavailable notice", async () => {
   const first = { ...snap, generation: "g1", reset: true, before: 0, state: "working",
     live: [{ id: "live:old:0", role: "assistant", text: "Old overlay", at: 43 }] };
   let bridge: Record<string, unknown> = first;
@@ -386,11 +386,16 @@ test("web removes an interrupted overlay without resetting the scroller or publi
     await until(() => existing.length > 1);
     expect(existing.at(-1)).toMatchObject({ piView: view, working: true });
     expect(existing.at(-1)?.messages.map((m) => m.text)).toEqual(["hi", "hello"]);
+    bridge = { ok: false, error: "not_available" };
     chats.watch(addr, b);
-    expect(joined).toHaveLength(0);
-    bridge = { ...first, state: "idle", live: [] };
     await until(() => joined.length);
-    expect(joined[0]).toMatchObject({ piView: view, working: false });
+    expect(joined).toHaveLength(1);
+    expect(joined[0]).toMatchObject({ cli: "pi", notice: "pi-unavailable", messages: [] });
+    expect(joined[0].piView).toBeUndefined();
+    expect(joined[0].piHistory).toBeUndefined();
+    bridge = { ...first, state: "idle", live: [] };
+    await until(() => joined.length > 1);
+    expect(joined[1]).toMatchObject({ piView: view, working: false });
   } finally { chats.unwatch(addr, a); chats.unwatch(addr, b); }
 });
 

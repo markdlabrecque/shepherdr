@@ -1495,7 +1495,7 @@ export default class Chat extends View {
   // Enter: now (while the agent works, it takes it mid-turn). Ctrl+Enter while it
   // works: held, and sent by itself once it is free.
   send(cx, hold = false) {
-    if (this.kind === "pi" && (this.phase !== "ready" || (!hold && this.status() === "blocked"))) return;
+    if (this.kind === "pi" && (this.phase !== "ready" || this.piReader?.piFresh || (!hold && this.status() === "blocked"))) return;
     // A picked "#space" goes as its mention, which names its target (core/mentions.js).
     const text = mentions.expandTasks(mentions.expand(this.box.value().trim(), this.picked), this.pickedTasks);
     this.picked = [];
@@ -1579,8 +1579,9 @@ export default class Chat extends View {
       match: norm(msg.text).slice(0, 60) || null, msg };
     if (kind === "pi") p.piPrior = new Set();
     this.pending.push(p);
-    const isSamePi = () => this.kind === "pi" && addr === msg.piAddr && this.addr === addr && this.piReader?.pid === msg.pi?.pid
-      && samePiHistory(msg.pi, this.piReader?.pi);
+    const reader = this.piReader, barrier = reader?.piBarrier;
+    const isSamePi = () => this.kind === "pi" && addr === msg.piAddr && this.addr === addr && this.piReader === reader
+      && !reader?.piFresh && reader?.piBarrier === barrier && reader?.pid === msg.pi?.pid && samePiHistory(msg.pi, reader?.pi);
     if (kind === "pi" && (!wasPi || !msg.pi || !isSamePi())) {
       p.failed = wasPi && !msg.pi ? PI_UNAVAILABLE : "The terminal changed before this message could be sent. Open it before writing a new message.";
       p.noRetry = true;
@@ -1602,8 +1603,8 @@ export default class Chat extends View {
         // last time gets only its Enter now, never typed twice)
         const io = this.sendIo(cx);
         io.pi = (value) => isSamePi()
-          ? piSend((...a) => this.piExec(...a), addr, msg.pi, msg.id, value, msg.hold ? "hold" : "now")
-          : { code: 1, stderr: "Pi is no longer running in this terminal.", noRetry: true };
+          ? piSend((...a) => this.piExec(...a, isSamePi), addr, msg.pi, msg.id, value, msg.hold ? "hold" : "now")
+          : { code: 1, stderr: "Pi could not confirm the open conversation. Your message was not sent.", noRetry: true };
         r = await sendTyped(io, addr, kind, p.sent, SETTLE, !!msg.stuck);
         if (r.waiting) {
           if (!this.pending.includes(p)) return; // a new Pi history already put the text back in the draft
@@ -1666,13 +1667,15 @@ export default class Chat extends View {
     return last ? `It said: ${last.slice(0, 200)}` : "";
   }
 
-  async piExec(script, args, on, input) {
+  async piExec(script, args, on, input, current) {
     // Herdr's exec has no stdin. Keep the prompt out of argv and off disk on the agent's machine.
     const tmp = await exec("mktemp", ["-d", "/tmp/shepherdr-pi-send.XXXXXXXX"]);
     if (tmp.code !== 0) throw new Error("Can't prepare Pi message.");
     const dir = tmp.stdout.trim(), file = `${dir}/message`;
     try {
       await writeTextFile(file, input, null);
+      // The foreground can become unverified while preparing the stdin file.
+      if (current && !current()) return { code: 1, stdout: '{"ok":false,"error":"stale_view"}' };
       const local = 'f=$1; shift; exec "$@" < "$f"';
       const cmd = ["sh", "-c", script, ...args];
       return await exec("sh", ["-c", local, "pi-chat", file, ...(on ? ["hc", "exec", "--on", on, "--stdin", "--timeout", "10", "--", ...cmd] : cmd)], { timeout: 15 });
@@ -1683,7 +1686,7 @@ export default class Chat extends View {
   }
 
   retry(p, cx) {
-    if (p.noRetry || p.ambiguous) return;
+    if (p.noRetry || p.ambiguous || (this.kind === "pi" && this.piReader?.piFresh)) return;
     this.pending = this.pending.filter((x) => x !== p);
     this.deliver(p.msg, cx);
   }
@@ -1714,7 +1717,7 @@ export default class Chat extends View {
 
   // A held message sent at once (the agent takes it mid-turn).
   sendQueued(msg, cx) {
-    if (this.kind === "pi" && this.status() === "blocked") return;
+    if (this.kind === "pi" && (this.piReader?.piFresh || this.status() === "blocked")) return;
     this.queue = this.queue.filter((m) => m !== msg);
     if (msg.raw && this.kind !== "pi") personHc(["send", this.addr, msg.text]);
     else this.deliver({ ...msg, hold: false }, cx);

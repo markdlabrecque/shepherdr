@@ -236,6 +236,43 @@ test("blocked desktop keeps a draft and Pi-only controls cannot trigger another 
   }
 });
 
+test("desktop leaves a draft and held send alone while the Pi target is unverified", async () => {
+  let draft = "keep this draft";
+  const queued = { text: "keep this held", files: [] };
+  const delivered: unknown[] = [];
+  const self = { kind: "pi", phase: "ready", piReader: { piFresh: true, pi: snapshot, pid: 77 }, addr,
+    status: () => "idle", files: [], queue: [queued], saveSoon() {},
+    box: { value: () => draft, set_value: (value: string) => { draft = value; } },
+    deliver: (message: unknown) => delivered.push(message) };
+  const cx = { notify() {}, timer: { after() {} } };
+  method("send", { piTarget, piQuoteFor, piRequestId: () => "fresh", note() {},
+    mentions: { expand: (v: string) => v, expandTasks: (v: string) => v } }).call(self, cx);
+  method("sendQueued").call(self, queued, cx);
+  expect(draft).toBe("keep this draft");
+  expect(self.queue).toEqual([queued]);
+  expect(delivered).toEqual([]);
+});
+
+test("desktop cancels a Pi send invalidated while its stdin is being prepared", async () => {
+  let current = true, file = "", dispatched = false;
+  const exec = async (prog: string, args: string[]) => {
+    if (prog === "sh") { dispatched = true; return { code: 0, stdout: '{"ok":true,"status":"accepted"}' }; }
+    const r = Bun.spawnSync([prog, ...args]);
+    return { code: r.exitCode, stdout: r.stdout.toString() };
+  };
+  const go = method("piExec", { exec, writeTextFile: (path: string, input: string) => {
+    file = path;
+    writeFileSync(path, input);
+    current = false;
+  } });
+  const result = await piSend((...a: [string, string[], string | null, string]) => go.call({}, ...a, () => current),
+    addr, piTarget(77, snapshot), "pending", "keep these words");
+  expect(result).toMatchObject({ code: 1, noRetry: true });
+  expect(dispatched).toBeFalse();
+  expect(file).not.toBe("");
+  expect(existsSync(file)).toBeFalse();
+});
+
 test("desktop Pi stdin file is private, routed on the right machine and removed after a failed transport", async () => {
   const input = JSON.stringify({ body: "text not for argv" });
   let file = "";
