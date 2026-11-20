@@ -641,15 +641,19 @@ export default class Chat extends View {
     cx.timer.after(400, (cx) => { if (Date.now() - this.saveAt >= 380) cx.spawn(async () => this.saveDraft()); });
   }
 
-  async saveDraft() {
+  saveDraft() {
     const d = { text: this.box.value(), files: this.files, quote: this.quote, queue: this.queue };
     this.markTyping(!!(d.text.trim() || d.files.length || d.quote));
     const empty = !d.text.trim() && !d.files.length && !d.quote && !d.queue.length;
-    try {
-      if (empty) { if (await fs.exists(this.draftFile)) await fs.unlink(this.draftFile); return; }
+    const draft = empty ? null : JSON.stringify(d);
+    const file = this.draftFile;
+    const save = (this.draftSave ?? Promise.resolve()).then(async () => {
+      if (draft === null) { if (await fs.exists(file)) await fs.unlink(file); return; }
       await fs.mkdir(`${appHome()}/data/chat-drafts`, { recursive: true });
-      await fs.writeFile(this.draftFile, JSON.stringify(d));
-    } catch {}
+      await fs.writeFile(file, draft);
+    }).catch(() => {});
+    this.draftSave = save;
+    return save;
   }
 
   // While the box holds unsent words, its agent's terminal says so (herdr.typing=<ms>, again each
@@ -1133,7 +1137,11 @@ export default class Chat extends View {
     if (gone || t?.state !== "live") {
       if (this.piReader) {
         this.piReader = null; // Fence prepared sends before any awaits or window closure.
+        // An in-flight request may come back as waiting or definitively refused. Give it a
+        // chance to restore those drafts before the composer (and its save timer) goes away.
+        const inFlight = this.pending.filter((p) => p.piDispatched && p.piSendDone).map((p) => p.piSendDone);
         if (this.recoverPiOutgoing(null, cx, true)) await this.saveDraft();
+        await Promise.allSettled(inFlight);
       }
       // Restarted from here (perhaps before Herdr restarted): the new agent carries the origin.
       const next = terminals().find((x) => x.state === "live" && x.address !== this.addr && x.labels?.["herdr.chat.origin"] === this.originKey);
@@ -1457,7 +1465,7 @@ export default class Chat extends View {
           // A Coordinator tab's chat stays: empty again, ready to start the next one. One that ended before it ever
           // ran (its CLI not found on another machine, GitHub #839) says why, and the message goes back in the box.
           if (this.role) {
-            const lost = !this.path ? this.pending.filter((p) => p.msg || p.text) : [];
+            const lost = !this.path ? this.pending.filter((p) => !p.piPrior && (p.msg || p.text)) : [];
             const why = lost.length ? await this.endedWhy(this.addr) : "";
             this.startFresh();
             if (lost.length) {
@@ -1635,8 +1643,18 @@ export default class Chat extends View {
         io.pi = (value) => isSamePi()
           ? piSend((...a) => this.piExec(...a, beforeDispatch), addr, msg.pi, msg.id, value, msg.hold ? "hold" : "now")
           : { code: 1, canceled: true };
-        r = await sendTyped(io, addr, kind, p.sent, SETTLE, !!msg.stuck);
-        if (r.canceled || (r.waiting && !isSamePi())) { await restoreUnsent(); return; }
+        const send = sendTyped(io, addr, kind, p.sent, SETTLE, !!msg.stuck);
+        if (kind === "pi") {
+          p.piSendDone = send.then(async (result) => {
+            const unsent = result.waiting || (result.code !== 0 && !result.ambiguous);
+            if (result.canceled || (unsent && !isSamePi())) { await restoreUnsent(); return null; }
+            if (unsent) p.piDispatched = false;
+            return result;
+          }).finally(() => { p.piSendDone = null; });
+        }
+        r = await (p.piSendDone ?? send);
+        if (!r) return;
+        if (r.waiting && !isSamePi()) { await restoreUnsent(); return; }
         if (r.waiting) {
           if (!this.pending.includes(p)) return; // a new Pi history already put the text back in the draft
           this.pending = this.pending.filter((x) => x !== p);

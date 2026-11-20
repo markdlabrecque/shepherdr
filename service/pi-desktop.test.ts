@@ -277,6 +277,73 @@ test("desktop invalidates the reader and saves only unsent drafts when its termi
   expect(self.pending.map((p: any) => p.msg.text)).toEqual(["maybe sent"]);
 });
 
+test("desktop waits for in-flight Pi refusals on exit without restoring unconfirmed sends", async () => {
+  for (const answer of [json({ ok: false, error: "stale_session" }, 1), json({ ok: true, status: "waiting" }),
+    json({ ok: false, error: "unconfirmed", ambiguous: true }, 1)]) {
+    const files = [{ path: "example.txt", name: "example.txt" }];
+    const jobs: Promise<unknown>[] = [];
+    let draft = "", saved: unknown, finish!: (value: typeof answer) => void, dispatched!: () => void;
+    const sending = new Promise((resolve) => { dispatched = () => resolve(undefined); });
+    const self: any = { addr, kind: "pi", phase: "ready", piReader: { pid: 77, pi: snapshot }, pending: [], queue: [], files: [],
+      box: { value: () => draft, set_value: (text: string) => { draft = text; } },
+      taskTags: () => "", saveSoon() {}, async saveDraft() { saved = { text: draft, files: this.files }; },
+      restorePiDraft: method("restorePiDraft"), recoverPiOutgoing: method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }),
+      sendIo: () => ({}), set(phase: string) { this.phase = phase; },
+      piExec: (_s: string, _args: string[], _on: string, _input: string, current: () => boolean) => {
+        expect(current()).toBeTrue();
+        dispatched();
+        return new Promise((resolve) => { finish = resolve; });
+      },
+    };
+    const cx = { notify() {}, spawn: (fn: Function) => jobs.push(fn(cx)) };
+    method("deliver", { messageBody, refusal, sendTyped, piSend, piQuoteFor, piVisibleBody, samePiHistory,
+      attach: { deliver: async () => [] }, norm: (s: string) => s, SETTLE: null })
+      .call(self, { text: "outgoing draft", piAddr: addr, pi: piTarget(77, snapshot), files }, cx);
+    await sending;
+    const exit = method("locate", { hc: async () => ({ stdout: "", stderr: "not_found" }), terminals: () => [] }).call(self, cx);
+    await Promise.resolve();
+    expect(self.piReader).toBeNull();
+    expect(self.phase).not.toBe("ended");
+    finish(answer);
+    await Promise.all([exit, ...jobs]);
+    expect(self.phase).toBe("ended");
+    if (JSON.parse(answer.stdout).ambiguous) {
+      expect(saved).toBeUndefined();
+      expect(self.pending[0].ambiguous).toBeTrue();
+    } else {
+      expect(saved).toEqual({ text: "outgoing draft", files });
+      expect(self.pending).toEqual([]);
+    }
+  }
+});
+
+test("a desktop save delayed by filesystem I/O cannot delete a newer recovered draft", async () => {
+  let draft = "", disk: string | null = "old draft", finish!: (exists: boolean) => void;
+  const fs = { exists: () => new Promise((resolve) => { finish = resolve; }), unlink: async () => { disk = null; },
+    mkdir: async () => {}, writeFile: async (_file: string, contents: string) => { disk = contents; } };
+  const self = { box: { value: () => draft }, files: [] as { path: string }[], quote: null, queue: [], draftFile: "draft", markTyping() {} };
+  const saveDraft = method("saveDraft", { fs, appHome: () => "/scratch" });
+  const older = saveDraft.call(self);
+  await Promise.resolve();
+  draft = "restored words";
+  self.files = [{ path: "attachment" }];
+  const newer = saveDraft.call(self);
+  finish(true);
+  await Promise.all([older, newer]);
+  expect(JSON.parse(disk!)).toMatchObject({ text: draft, files: self.files });
+});
+
+test("desktop Assistant exit does not move ambiguous Pi sends into a fresh composer", async () => {
+  let draft = "";
+  const attempt = { piPrior: new Set(), ambiguous: true, msg: { text: "possibly sent", files: [{ path: "example.txt" }] } };
+  const self = { role: "coordinator", phase: "ended", pending: [attempt], async locate() {}, resumable: () => false,
+    startFresh() { this.phase = "fresh"; }, endedWhy: async () => "", box: { value: () => draft, set_value: (text: string) => { draft = text; } } };
+  await method("follow", { toast() {} }).call(self, { notify() {} });
+  expect(self.phase).toBe("fresh");
+  expect(self.pending).toEqual([attempt]);
+  expect(draft).toBe("");
+});
+
 test("desktop saves an editable draft when the send is canceled before dispatch", async () => {
   const files = [{ path: "example.txt", name: "example.txt" }];
   let draft = "new words", saved: unknown;
