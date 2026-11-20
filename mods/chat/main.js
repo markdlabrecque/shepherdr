@@ -1270,7 +1270,8 @@ export default class Chat extends View {
     for (const u of users) if (this.own?.has(u.id)) delete u.from;
     if (!this.pending?.length) return;
     const matches = (u, p) => (u.at ?? 0) >= p.at - 5000 && (p.piPrior
-      ? p.piBody !== undefined && !p.piPrior.has(u.id) && u.piBody === p.piBody
+      ? p.msg?.piAddr === this.addr && samePiHistory(p.msg.pi, this.piReader?.pi)
+        && p.piBody !== undefined && !p.piPrior.has(u.id) && u.piBody === p.piBody
       : same(u.text, p.sent) || (p.match && norm(u.text).includes(p.match)) || (!p.match && u.images));
     for (const id of ownWords(users, this.pending, matches)) {
       (this.own ??= new Set()).add(id);
@@ -1287,19 +1288,19 @@ export default class Chat extends View {
     for (const p of this.pending) if (p.piPrior) for (const id of consumed) p.piPrior.add(id);
   }
 
-  // Unlike a dropped socket, a different Pi history can't acknowledge the old sends. Keep the
-  // person's words and files as a draft, without their old quote and without sending anything.
-  recoverPiOutgoing(snapshot, cx, unsentOnly = false) {
+  // A different Pi history can't acknowledge the old sends. Restore only confirmed unsent words
+  // and files, without the old quote. A dispatched send may already have reached Pi.
+  recoverPiOutgoing(snapshot, cx, leavingPi = false) {
     const history = piHistoryOf(snapshot);
     this.quote = piQuoteFor(this.quote, snapshot);
     this.piHistory = history;
     const belongs = (msg) => !msg?.piAddr || (msg.piAddr === this.addr && samePiHistory(msg.pi, snapshot));
-    const pending = new Set(this.pending.filter((p) => !belongs(p.msg) && (!unsentOnly || (!p.piDispatched && !p.delivered && !p.ambiguous))));
+    const pending = new Set(this.pending.filter((p) => !belongs(p.msg) && !p.piDispatched && !p.delivered && !p.ambiguous));
     const missed = [...Array.from(pending, (p) => p.msg), ...this.queue.filter((m) => !belongs(m))];
     if (!missed.length) return false;
     this.pending = this.pending.filter((p) => !pending.has(p));
     this.queue = this.queue.filter(belongs);
-    this.restorePiDraft(missed, cx, unsentOnly ? "Pi stopped before sending. The unsent words are back in the draft."
+    this.restorePiDraft(missed, cx, leavingPi ? "Pi stopped before sending. The unsent words are back in the draft."
       : "Pi changed conversations. Check the terminal before sending the restored draft.");
     return true;
   }
@@ -1730,7 +1731,8 @@ export default class Chat extends View {
       await writeTextFile(file, input, null);
       // The foreground can become unverified while preparing the stdin file.
       if (current && !current()) return { code: 1, stdout: '{"ok":false,"error":"stale_view"}' };
-      const local = 'f=$1; shift; exec "$@" < "$f"';
+      // If the local redirection fails, exec never runs. Only that path reports a definite non-send.
+      const local = `f=$1; shift; if { exec "$@"; } < "$f"; then exit 0; fi; printf '%s\\n' '{"ok":false,"error":"stdin_unavailable"}'; exit 1`;
       const cmd = ["sh", "-c", script, ...args];
       return await exec("sh", ["-c", local, "pi-chat", file, ...(on ? ["hc", "exec", "--on", on, "--stdin", "--timeout", "10", "--", ...cmd] : cmd)], { timeout: 15 });
     } finally {

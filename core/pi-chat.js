@@ -10,6 +10,7 @@ const refusals = {
   stale_session: "Pi switched sessions before this message could be sent. Check the terminal before writing a new message.",
   stale_leaf: "Pi changed branches before this message could be sent. Check the terminal before writing a new message.",
   stale_view: "Pi could not confirm the open conversation. Your message was not sent.",
+  stdin_unavailable: "Pi could not open the prepared message. Your message was not sent.",
   not_available: PI_UNAVAILABLE,
   unsafe_runtime: PI_UNAVAILABLE,
   unsafe_registry: PI_UNAVAILABLE,
@@ -95,8 +96,9 @@ export async function piSend(run, addr, target, id, body, mode = "now") {
       return { code: 0, stdout: r.stdout, waiting: answer.status === "waiting" };
     if (answer?.ok === false && !answer.ambiguous && Object.hasOwn(refusals, answer.error)) {
       const stderr = refusals[answer.error];
-      return { code: 1, stderr, noRetry: answer.error.startsWith("stale_") || stderr === PI_UNAVAILABLE || answer.error === "id_conflict",
-        ...(answer.error.startsWith("stale_") ? { canceled: true } : {}) };
+      const canceled = answer.error.startsWith("stale_") || answer.error === "stdin_unavailable";
+      return { code: 1, stderr, noRetry: canceled || stderr === PI_UNAVAILABLE || answer.error === "id_conflict",
+        ...(canceled ? { canceled: true } : {}) };
     }
   } catch {}
   return { code: 1, stderr: PI_UNCONFIRMED, ambiguous: true, noRetry: true };

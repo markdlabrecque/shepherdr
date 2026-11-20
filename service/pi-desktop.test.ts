@@ -54,7 +54,7 @@ test("desktop Pi steering receipts stay pending until a new user record consumes
     results: new Map(), opened: new Set(), box: { value: () => draft, set_value: (s: string) => { draft = s; } },
     status: method("status"), saveSoon() {}, taskTags: () => '<hc task="7">brief</hc>\n',
     sendIo: () => ({ hc: () => { throw new Error("Pi never types in the terminal"); } }),
-    settlePending: method("settlePending", { norm, same: (a: string, b: string) => norm(a) === norm(b), ownWords }),
+    settlePending: method("settlePending", { norm, same: (a: string, b: string) => norm(a) === norm(b), ownWords, samePiHistory }),
     recoverPiOutgoing: method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }),
     piExec: async (_: string, args: string[], on: string, input: string) => {
       sent.push({ args, on, ...JSON.parse(input) });
@@ -195,6 +195,23 @@ test("desktop restores outgoing messages from another Pi branch as a draft witho
   expect(self.queue.map((m) => m.text)).toEqual(["this branch only"]);
   expect(self.quote).toBeNull();
   expect(draft).toBe("existing draft\n\nprevious send\n\nprevious hold");
+});
+
+test("a replacement Pi snapshot does not restore or acknowledge earlier uncertain sends", () => {
+  const replacement = { ...snapshot, instance: "replacement" };
+  const sent = (text: string, state: object) => ({ msg: { text, piAddr: addr, pi: piTarget(77, snapshot), files: [] },
+    piBody: text, piPrior: new Set(), at: 1, ...state });
+  const unrecoverable = [sent("in flight", { piDispatched: true }), sent("possibly sent", { ambiguous: true }),
+    sent("accepted", { delivered: true })];
+  let draft = "";
+  const self = { addr, piReader: { pi: replacement }, pending: [...unrecoverable, sent("confirmed unsent", {})], queue: [], files: [],
+    conv: { items: unrecoverable.map((p) => ({ kind: "user", id: p.piBody, piBody: p.piBody, at: 2 })) },
+    box: { value: () => draft, set_value: (text: string) => { draft = text; } }, restorePiDraft: method("restorePiDraft"), saveSoon() {} };
+  method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }).call(self, replacement, {});
+  expect(draft).toBe("confirmed unsent");
+  expect(self.pending).toEqual(unrecoverable);
+  method("settlePending", { ownWords, samePiHistory }).call(self);
+  expect(self.pending).toEqual(unrecoverable);
 });
 
 test("desktop does not attach a restored quote to a replacement Pi session", async () => {
@@ -409,6 +426,23 @@ test("desktop cancels a Pi send invalidated while its stdin is being prepared", 
   expect(dispatched).toBeFalse();
   expect(file).not.toBe("");
   expect(existsSync(file)).toBeFalse();
+});
+
+test("desktop distinguishes a local stdin-open failure from a launched Pi client failure", async () => {
+  for (const missing of [true, false]) {
+    let opened = "";
+    const go = method("piExec", { writeTextFile: (path: string, input: string) => {
+      if (!missing) writeFileSync(path, input);
+    }, async exec(prog: string, args: string[]) {
+      const r = Bun.spawnSync([prog, ...args]);
+      if (prog === "sh") opened = r.stderr.toString();
+      return { code: r.exitCode, stdout: r.stdout.toString() };
+    } });
+    const result = await piSend((_script: string, args: string[], on: string | null, input: string) =>
+      go.call({}, 'echo client-started >&2; exit 1', args, on, input, () => true), "t9", piTarget(77, snapshot), "id", "words");
+    expect(opened.includes("client-started")).toBe(!missing);
+    expect(result).toMatchObject(missing ? { code: 1, canceled: true } : { code: 1, ambiguous: true });
+  }
 });
 
 test("desktop Pi stdin file is private, routed on the right machine and removed after a failed transport", async () => {
