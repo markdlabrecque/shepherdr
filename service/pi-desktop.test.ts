@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { readFileSync, existsSync, statSync, writeFileSync } from "node:fs";
-import { ChatReader } from "../core/chat-reader.js";
+import { ChatReader, kindOf } from "../core/chat-reader.js";
 import { excerpt } from "../core/chat-log.js";
 import { ownWords } from "../core/chat-view.js";
 import { piSend, piTarget, piHistoryOf, piQuoteFor, piVisibleBody, samePiHistory, PI_BLOCKED, PI_UNCONFIRMED, PI_UNAVAILABLE } from "../core/pi-chat.js";
@@ -149,7 +149,11 @@ test("desktop held sends keep the old leaf; Send now steers and an unconfirmed s
     addr, kind: "pi", machine: "desktop-remote", phase: "ready", piReader: { pid: 77, pi: snapshot },
     queue: [], pending: [], files: [], asks: [{ stale: true }], status: () => "idle", saveSoon() {}, async saveDraft() {}, taskTags: () => "", sendIo: () => ({}),
     box: { value: () => draft, set_value: (text: string) => { draft = text; } }, restorePiDraft: method("restorePiDraft"),
-    piExec: async (_: string, args: string[], on: string, input: string) => { sent.push({ args, on, ...JSON.parse(input) }); return answer; },
+    piExec: async (_: string, args: string[], on: string, input: string, current: () => boolean) => {
+      expect(current()).toBeTrue();
+      sent.push({ args, on, ...JSON.parse(input) });
+      return answer;
+    },
     deliver: method("deliver", { messageBody, refusal, sendTyped, piSend, piQuoteFor, piVisibleBody, samePiHistory, PI_UNAVAILABLE,
       attach: { deliver: async () => [] }, norm: (s: string) => s, SETTLE: null,
       openCard: () => { throw new Error("Pi does not use Claude or Codex's cards"); } }),
@@ -265,13 +269,19 @@ test("desktop invalidates the reader and saves only unsent drafts when its termi
   const message = (text: string) => ({ text, piAddr: addr, pi: target, files });
   let draft = "still typing", saved: unknown;
   const self: any = { addr, kind: "pi", phase: "ready", piReader: { pi: snapshot },
-    pending: [{ msg: message("not sent") }, { msg: message("maybe sent"), piDispatched: true }], queue: [], files: [],
+    pending: [{ msg: message("not sent"), failed: "Pick a model" }, { msg: message("maybe sent"), piDispatched: true }], queue: [], files: [],
     box: { value: () => draft, set_value: (text: string) => { draft = text; } }, saveSoon() {},
     restorePiDraft: method("restorePiDraft"), recoverPiOutgoing: method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }),
     async saveDraft() { expect(this.piReader).toBeNull(); saved = { text: draft, files: this.files }; },
     set(phase: string) { expect(saved).toBeDefined(); this.phase = phase; },
+    checkLost: async () => false,
   };
-  await method("locate", { hc: async () => ({ stdout: "", stderr: "not_found" }), terminals: () => [] }).call(self, {});
+  let report = { stdout: JSON.stringify({ state: "live", foreground: { name: "zsh", pid: 45 } }), stderr: "" };
+  const locate = method("locate", { kindOf, hc: async () => report, terminals: () => [] });
+  await locate.call(self, {});
+  expect(self.phase).toBe("unsupported");
+  report = { stdout: "", stderr: "not_found" };
+  await locate.call(self, {});
   expect(self.phase).toBe("ended");
   expect(saved).toEqual({ text: "still typing\n\nnot sent", files });
   expect(self.pending.map((p: any) => p.msg.text)).toEqual(["maybe sent"]);
@@ -288,7 +298,7 @@ test("desktop waits for in-flight Pi refusals on exit without restoring unconfir
       box: { value: () => draft, set_value: (text: string) => { draft = text; } },
       taskTags: () => "", saveSoon() {}, async saveDraft() { saved = { text: draft, files: this.files }; },
       restorePiDraft: method("restorePiDraft"), recoverPiOutgoing: method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }),
-      sendIo: () => ({}), set(phase: string) { this.phase = phase; },
+      sendIo: () => ({}), set(phase: string) { this.phase = phase; }, checkLost: async () => false,
       piExec: (_s: string, _args: string[], _on: string, _input: string, current: () => boolean) => {
         expect(current()).toBeTrue();
         dispatched();
@@ -300,13 +310,14 @@ test("desktop waits for in-flight Pi refusals on exit without restoring unconfir
       attach: { deliver: async () => [] }, norm: (s: string) => s, SETTLE: null })
       .call(self, { text: "outgoing draft", piAddr: addr, pi: piTarget(77, snapshot), files }, cx);
     await sending;
-    const exit = method("locate", { hc: async () => ({ stdout: "", stderr: "not_found" }), terminals: () => [] }).call(self, cx);
+    const exit = method("locate", { kindOf, terminals: () => [], hc: async () => ({ stderr: "",
+      stdout: JSON.stringify({ state: "live", foreground: { name: "zsh", pid: 45 } }) }) }).call(self, cx);
     await Promise.resolve();
     expect(self.piReader).toBeNull();
     expect(self.phase).not.toBe("ended");
     finish(answer);
     await Promise.all([exit, ...jobs]);
-    expect(self.phase).toBe("ended");
+    expect(self.phase).toBe("unsupported");
     if (JSON.parse(answer.stdout).ambiguous) {
       expect(saved).toBeUndefined();
       expect(self.pending[0].ambiguous).toBeTrue();
@@ -361,6 +372,23 @@ test("desktop saves an editable draft when the send is canceled before dispatch"
   await jobs[0];
   expect(self.pending).toEqual([]);
   expect(saved).toEqual({ text: "new words\n\ncanceled words", files });
+});
+
+test("desktop saves the draft if Pi's local stdin file cannot be prepared", async () => {
+  const jobs: Promise<unknown>[] = [], files = [{ path: "example.txt", name: "example.txt" }];
+  let draft = "", saved: unknown;
+  const self = { addr, kind: "pi", phase: "ready", piReader: { pid: 77, pi: snapshot }, pending: [], files: [],
+    box: { value: () => draft, set_value: (value: string) => { draft = value; } },
+    taskTags: () => "", saveSoon() {}, async saveDraft() { saved = { text: draft, files: this.files }; },
+    restorePiDraft: method("restorePiDraft"), sendIo: () => ({}),
+    piExec: method("piExec", { exec: async (cmd: string) => { expect(cmd).toBe("mktemp"); return { code: 1 }; } }),
+  };
+  method("deliver", { messageBody, refusal, sendTyped, piSend, piQuoteFor, piVisibleBody, samePiHistory,
+    attach: { deliver: async () => [] }, norm: (s: string) => s, SETTLE: null }).call(self,
+    { text: "unsent words", piAddr: addr, pi: piTarget(77, snapshot), files }, { notify() {}, spawn: (fn: Function) => jobs.push(fn()) });
+  await Promise.all(jobs);
+  expect(self.pending).toEqual([]);
+  expect(saved).toEqual({ text: "unsent words", files });
 });
 
 test("desktop cancels a Pi send invalidated while its stdin is being prepared", async () => {

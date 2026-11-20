@@ -1134,15 +1134,19 @@ export default class Chat extends View {
       await this.piReader?.locate({ state: "live" });
       return;
     }
-    if (gone || t?.state !== "live") {
-      if (this.piReader) {
-        this.piReader = null; // Fence prepared sends before any awaits or window closure.
-        // An in-flight request may come back as waiting or definitively refused. Give it a
-        // chance to restore those drafts before the composer (and its save timer) goes away.
-        const inFlight = this.pending.filter((p) => p.piDispatched && p.piSendDone).map((p) => p.piSendDone);
-        if (this.recoverPiOutgoing(null, cx, true)) await this.saveDraft();
-        await Promise.allSettled(inFlight);
-      }
+    const kind = kindOf(t);
+    const exited = gone || t?.state !== "live";
+    // An empty foreground report can be a reconnect. A known shell, other agent, or terminal
+    // exit retires the reader and saves confirmed non-sends before we leave this conversation.
+    const foregroundKnown = t?.foreground?.name || t?.foreground?.pid;
+    if (this.piReader && (exited || (kind !== "pi" && (kind || foregroundKnown)))) {
+      this.piReader = null; // Fence prepared sends before any awaits or window closure.
+      const inFlight = this.pending.filter((p) => p.piDispatched && p.piSendDone).map((p) => p.piSendDone);
+      if (this.recoverPiOutgoing(null, cx, true)) await this.saveDraft();
+      await Promise.allSettled(inFlight);
+      if (this.addr !== addr || this.swapping) return;
+    }
+    if (exited) {
       // Restarted from here (perhaps before Herdr restarted): the new agent carries the origin.
       const next = terminals().find((x) => x.state === "live" && x.address !== this.addr && x.labels?.["herdr.chat.origin"] === this.originKey);
       if (next) { this.follow_to(next.address); return; }
@@ -1161,7 +1165,6 @@ export default class Chat extends View {
       this.set("ended", cx);
       return;
     }
-    const kind = kindOf(t);
     if (this.piReader && (kind !== "pi" || t.foreground?.pid !== this.piReader.pid)) this.piReader.refreshPi();
     // Parked behind this chat, the terminal lost core keep (terminal.park turns it off): turn it
     // back on, so the agent survives a lost core like any pane's terminal.
@@ -1195,7 +1198,7 @@ export default class Chat extends View {
       return;
     }
     this.piReader = null;
-    if (this.kind === "pi") { this.recoverPiOutgoing(null, cx); this.kind = null; this.reset(); this.set("finding", cx); }
+    if (this.kind === "pi") { this.kind = null; this.reset(); this.set("finding", cx); }
     this.loadFirst(cx, t.labels);
     this.argv = t.foreground?.argv ?? t.argv ?? null;
     const pid = t.foreground?.pid;
@@ -1615,7 +1618,7 @@ export default class Chat extends View {
     const restoreUnsent = async () => {
       if (!this.pending.includes(p)) return; // Already restored on a change or terminal exit.
       this.pending = this.pending.filter((x) => x !== p);
-      this.restorePiDraft([msg], cx, "Pi disconnected before sending. The unsent words are back in the draft.");
+      this.restorePiDraft([msg], cx, "Pi did not send the message. The unsent words are back in the draft.");
       await this.saveDraft();
       cx.notify();
     };
@@ -1646,8 +1649,9 @@ export default class Chat extends View {
         const send = sendTyped(io, addr, kind, p.sent, SETTLE, !!msg.stuck);
         if (kind === "pi") {
           p.piSendDone = send.then(async (result) => {
+            const notDispatched = result.code !== 0 && !p.piDispatched;
             const unsent = result.waiting || (result.code !== 0 && !result.ambiguous);
-            if (result.canceled || (unsent && !isSamePi())) { await restoreUnsent(); return null; }
+            if (result.canceled || notDispatched || (unsent && !isSamePi())) { await restoreUnsent(); return null; }
             if (unsent) p.piDispatched = false;
             return result;
           }).finally(() => { p.piSendDone = null; });
@@ -1668,6 +1672,7 @@ export default class Chat extends View {
         // here): the words answer it the "Reply instead…" way.
         if (r.code !== 0 && refusal(r).kind === "blocked" && (kind === "claude" || kind === "codex")) r = await this.replyInstead(p.sent, cx);
       } catch (e) {
+        if (kind === "pi" && !p.piDispatched) { await restoreUnsent(); return; }
         r = { code: 1, stderr: String(e?.message ?? e) };
       }
       // Kept as a bubble that sends again when pressed (clickRow), so nothing is lost.
