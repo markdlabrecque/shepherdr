@@ -144,10 +144,11 @@ test("desktop paging keeps its anchor and drops a tool response from the previou
 test("desktop held sends keep the old leaf; Send now steers and an unconfirmed send has no Retry", async () => {
   const sent: any[] = [];
   const jobs: Promise<unknown>[] = [];
-  let answer = json({ ok: true, status: "waiting" });
+  let answer = json({ ok: true, status: "waiting" }), draft = "";
   const self: any = {
     addr, kind: "pi", machine: "desktop-remote", phase: "ready", piReader: { pid: 77, pi: snapshot },
-    queue: [], pending: [], asks: [{ stale: true }], status: () => "idle", saveSoon() {}, taskTags: () => "", sendIo: () => ({}),
+    queue: [], pending: [], files: [], asks: [{ stale: true }], status: () => "idle", saveSoon() {}, async saveDraft() {}, taskTags: () => "", sendIo: () => ({}),
+    box: { value: () => draft, set_value: (text: string) => { draft = text; } }, restorePiDraft: method("restorePiDraft"),
     piExec: async (_: string, args: string[], on: string, input: string) => { sent.push({ args, on, ...JSON.parse(input) }); return answer; },
     deliver: method("deliver", { messageBody, refusal, sendTyped, piSend, piQuoteFor, piVisibleBody, samePiHistory, PI_UNAVAILABLE,
       attach: { deliver: async () => [] }, norm: (s: string) => s, SETTLE: null,
@@ -172,8 +173,10 @@ test("desktop held sends keep the old leaf; Send now steers and an unconfirmed s
   expect(self.queue).toEqual([]);
   self.kind = "codex";
   self.deliver(msg, cx);
-  expect(jobs).toHaveLength(0);
-  expect(self.pending[1]).toMatchObject({ failed: expect.stringContaining("terminal changed"), noRetry: true });
+  await jobs.pop();
+  expect(sent).toHaveLength(2);
+  expect(draft).toBe("/model");
+  expect(self.pending).toHaveLength(1);
 });
 
 test("desktop restores outgoing messages from another Pi branch as a draft without the quote", () => {
@@ -181,7 +184,7 @@ test("desktop restores outgoing messages from another Pi branch as a draft witho
   const message = (text: string, target = old) => ({ text, piAddr: addr, pi: piTarget(77, target), files: [] });
   let draft = "existing draft";
   const self = { addr, piHistory: piHistoryOf(old), pending: [{ msg: message("previous send") }],
-    queue: [message("previous hold"), message("this branch only", current)], quote: { id: "old quote" }, files: [],
+    queue: [message("previous hold"), message("this branch only", current)], quote: { id: "old quote" }, files: [], restorePiDraft: method("restorePiDraft"),
     box: { value: () => draft, set_value: (text: string) => { draft = text; } }, saveSoon() {} };
   method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }).call(self, current, {});
   expect(self.pending).toEqual([]);
@@ -240,17 +243,57 @@ test("desktop leaves a draft and held send alone while the Pi target is unverifi
   let draft = "keep this draft";
   const queued = { text: "keep this held", files: [] };
   const delivered: unknown[] = [];
-  const self = { kind: "pi", phase: "ready", piReader: { piFresh: true, pi: snapshot, pid: 77 }, addr,
+  const self = { kind: "pi", phase: "ready", piReader: null as null | { piFresh: boolean; pi: typeof snapshot; pid: number }, addr,
     status: () => "idle", files: [], queue: [queued], saveSoon() {},
     box: { value: () => draft, set_value: (value: string) => { draft = value; } },
     deliver: (message: unknown) => delivered.push(message) };
   const cx = { notify() {}, timer: { after() {} } };
-  method("send", { piTarget, piQuoteFor, piRequestId: () => "fresh", note() {},
-    mentions: { expand: (v: string) => v, expandTasks: (v: string) => v } }).call(self, cx);
-  method("sendQueued").call(self, queued, cx);
-  expect(draft).toBe("keep this draft");
-  expect(self.queue).toEqual([queued]);
-  expect(delivered).toEqual([]);
+  const send = method("send", { piTarget, piQuoteFor, piRequestId: () => "fresh", note() {},
+    mentions: { expand: (v: string) => v, expandTasks: (v: string) => v } });
+  for (const reader of [null, { piFresh: true, pi: snapshot, pid: 77 }]) {
+    self.piReader = reader;
+    send.call(self, cx);
+    method("sendQueued").call(self, queued, cx);
+    expect(draft).toBe("keep this draft");
+    expect(self.queue).toEqual([queued]);
+    expect(delivered).toEqual([]);
+  }
+});
+
+test("desktop invalidates the reader and saves only unsent drafts when its terminal disappears", async () => {
+  const target = piTarget(77, snapshot), files = [{ path: "retained file" }];
+  const message = (text: string) => ({ text, piAddr: addr, pi: target, files });
+  let draft = "still typing", saved: unknown;
+  const self: any = { addr, kind: "pi", phase: "ready", piReader: { pi: snapshot },
+    pending: [{ msg: message("not sent") }, { msg: message("maybe sent"), piDispatched: true }], queue: [], files: [],
+    box: { value: () => draft, set_value: (text: string) => { draft = text; } }, saveSoon() {},
+    restorePiDraft: method("restorePiDraft"), recoverPiOutgoing: method("recoverPiOutgoing", { piHistoryOf, piQuoteFor, samePiHistory }),
+    async saveDraft() { expect(this.piReader).toBeNull(); saved = { text: draft, files: this.files }; },
+    set(phase: string) { expect(saved).toBeDefined(); this.phase = phase; },
+  };
+  await method("locate", { hc: async () => ({ stdout: "", stderr: "not_found" }), terminals: () => [] }).call(self, {});
+  expect(self.phase).toBe("ended");
+  expect(saved).toEqual({ text: "still typing\n\nnot sent", files });
+  expect(self.pending.map((p: any) => p.msg.text)).toEqual(["maybe sent"]);
+});
+
+test("desktop saves an editable draft when the send is canceled before dispatch", async () => {
+  const files = [{ path: "example.txt", name: "example.txt" }];
+  let draft = "new words", saved: unknown;
+  const jobs: Promise<unknown>[] = [];
+  const self: any = { addr, kind: "pi", phase: "ready", piReader: { pid: 77, pi: snapshot, piBarrier: {} },
+    box: { value: () => draft, set_value: (text: string) => { draft = text; } }, files: [], pending: [],
+    taskTags: () => "", saveSoon() {}, async saveDraft() { saved = { text: draft, files: this.files }; },
+    restorePiDraft: method("restorePiDraft"), sendIo: () => ({}),
+    piExec: () => { throw new Error("must not call the old Pi"); },
+  };
+  const attach = { deliver: async () => { self.piReader.piBarrier = {}; return ["prepared path"]; } };
+  const cx = { notify() {}, spawn: (fn: Function) => jobs.push(fn(cx)) };
+  method("deliver", { messageBody, refusal, sendTyped, piSend, piQuoteFor, piVisibleBody, samePiHistory, attach,
+    norm: (s: string) => s, SETTLE: null }).call(self, { text: "canceled words", piAddr: addr, pi: piTarget(77, snapshot), files }, cx);
+  await jobs[0];
+  expect(self.pending).toEqual([]);
+  expect(saved).toEqual({ text: "new words\n\ncanceled words", files });
 });
 
 test("desktop cancels a Pi send invalidated while its stdin is being prepared", async () => {
@@ -267,7 +310,7 @@ test("desktop cancels a Pi send invalidated while its stdin is being prepared", 
   } });
   const result = await piSend((...a: [string, string[], string | null, string]) => go.call({}, ...a, () => current),
     addr, piTarget(77, snapshot), "pending", "keep these words");
-  expect(result).toMatchObject({ code: 1, noRetry: true });
+  expect(result).toMatchObject({ code: 1, noRetry: true, canceled: true });
   expect(dispatched).toBeFalse();
   expect(file).not.toBe("");
   expect(existsSync(file)).toBeFalse();
