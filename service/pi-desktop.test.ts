@@ -214,6 +214,29 @@ test("a replacement Pi snapshot does not restore or acknowledge earlier uncertai
   expect(self.pending).toEqual(unrecoverable);
 });
 
+test("desktop composer recalls persisted Pi messages, not unresolved sends", () => {
+  const recall = method("recallStep");
+  let text = "";
+  const pending: { text: string; piPrior?: Set<unknown>; ambiguous?: boolean; piDispatched?: boolean; delivered?: boolean }[] = [
+    { text: "possibly sent", piPrior: new Set(), ambiguous: true }, { text: "in flight", piPrior: new Set(), piDispatched: true },
+    { text: "accepted", piPrior: new Set(), delivered: true },
+  ];
+  const self = { box: { set_value: (value: string) => { text = value; } }, recall: -1, pending,
+    conv: { items: [] as { kind: string; text: string; from?: string }[] } };
+  expect(recall.call(self, 1)).toBeFalse();
+  expect(text).toBe("");
+  self.conv.items = [{ kind: "user", text: "accepted" }, { kind: "user", text: "another person's words", from: "someone" }];
+  expect(recall.call(self, 1)).toBeTrue();
+  expect(text).toBe("accepted");
+  recall.call(self, 1);
+  expect(text).toBe("accepted");
+  recall.call(self, -1);
+  expect(text).toBe("");
+  self.pending = [{ text: "non-Pi pending" }];
+  expect(recall.call(self, 1)).toBeTrue();
+  expect(text).toBe("non-Pi pending");
+});
+
 test("desktop does not attach a restored quote to a replacement Pi session", async () => {
   const old = { ...snapshot, session: "old", generation: "old" };
   const current = { ...snapshot, session: "current", generation: "current" };

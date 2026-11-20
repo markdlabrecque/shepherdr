@@ -1801,7 +1801,10 @@ export default class Chat extends View {
 
   // Up in an empty box (or one showing a recalled message): the previous message again.
   recallStep(dir) {
-    const mine = [...(this.conv?.items ?? []).filter((x) => x.kind === "user" && x.text && !x.from).map((x) => x.text), ...this.pending.map((p) => p.text)];
+    // Pi's persisted user rows are the recall history. A pending send may already have reached
+    // Pi, and recalling it would bypass the no-Retry guard by creating a new request.
+    const mine = [...(this.conv?.items ?? []).filter((x) => x.kind === "user" && x.text && !x.from).map((x) => x.text),
+      ...this.pending.filter((p) => !p.piPrior).map((p) => p.text)];
     const list = [...new Set(mine.reverse())];
     if (!list.length) return false;
     const next = this.recall + dir;
