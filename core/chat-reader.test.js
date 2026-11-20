@@ -32,19 +32,19 @@ function rig() {
   return { reader, take, pull };
 }
 
-test("Pi loss and reconnect replace the conversation, even with the same PID and session", async () => {
+test("temporary Pi bridge loss keeps verified rows until the replacement is confirmed", async () => {
   const { reader, take, pull } = rig();
   await reader.locate(terminal);
   await pull(snap({ items: [row("1:0", "previous branch")] }));
-  expect(texts(reader)).toEqual(["previous branch"]);
   const view = reader.piView;
   await pull({ ok: false, error: "not_available" });
-  expect(reader.state).toBe("unavailable");
-  expect(reader.conv).toBeNull();
+  expect(reader.piOffline).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["previous branch"]);
   const pending = reader.pull();
   const call = take("snapshot");
   expect(call.query).toBeUndefined();
-  call.reply(snap({ items: [row("2:0", "after reconnect")] }));
+  call.reply(snap({ instance: "restarted", items: [row("2:0", "after reconnect")] }));
   expect(await pending).toBeTrue();
   expect(reader.piView).not.toBe(view);
   expect(texts(reader)).toEqual(["after reconnect"]);
@@ -118,4 +118,109 @@ test("Pi discards delayed pages, results and snapshots after a branch, session o
   expect(call.query).toBeUndefined();
   call.reply(newSession);
   expect(await refresh).toBeTrue();
+});
+
+test("a fresh snapshot after cursor expiry retains overlapping loaded history and its view", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  const middle = row("mid:0", "middle"), last = row("last:0", "last");
+  await pull(snap({ before: 1, items: [middle, last] }));
+  const view = reader.piView;
+  const earlier = reader.earlier(view);
+  take("page").reply(snap({ items: [row("old:0", "older")] }));
+  expect(await earlier).toBeTrue();
+  reader.refreshPi();
+  const pending = reader.pull();
+  const snapshot = take("snapshot");
+  expect(snapshot.query).toBeUndefined();
+  snapshot.reply(snap({ before: 2, leaf: "compact", items: [last, row("compact:0", "summary", "compaction")] }));
+  expect(await pending).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(reader.start).toBe(0);
+  expect(texts(reader)).toEqual(["older", "middle", "last", "summary"]);
+});
+
+test("a wide compaction can recover a small gap without losing the loaded window", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  await pull(snap({ items: [row("first:0", "original turn")] }));
+  const view = reader.piView;
+  const pending = reader.pull();
+  const chunk = { ...row("summary:0", "", "compaction"), part: 0 };
+  take("snapshot").reply(snap({ before: 2, leaf: "summary", items: [{ ...chunk, text: "continues", part: 1 }] }));
+  await Bun.sleep(0);
+  const gap = take("page");
+  expect(gap.query).toEqual({ generation: "first", before: 2 });
+  gap.reply(snap({ before: 1, leaf: "summary", items: [{ ...chunk, text: "A summary " }] }));
+  expect(await pending).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(reader.start).toBe(0);
+  expect(texts(reader)).toEqual(["original turn", "A summary continues"]);
+});
+
+test("a large same-branch gap is recovered across intermittent timeouts without replacing the rendered view", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  await pull(snap({ items: [row("first:0", "original turn")], state: "working" }));
+  const view = reader.piView;
+  const latest = snap({ before: 4, leaf: "summary", items: [row("summary:0", "summary", "compaction")] });
+  const page = async (cursor, text) => {
+    await Bun.sleep(0);
+    const request = take("page");
+    expect(request.query.before).toBe(cursor);
+    request.reply(snap({ before: cursor - 1, items: [row(`gap-${cursor}:0`, text)] }));
+  };
+  const first = reader.pull();
+  take("snapshot").reply(latest);
+  await page(4, "third");
+  await page(3, "second");
+  expect(await first).toBeTrue();
+  expect(reader.pi.state).toBe("idle");
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["original turn"]);
+  expect(await pull({ ok: false, error: "timeout" })).toBeTrue();
+  const second = reader.pull();
+  const revalidate = take("snapshot");
+  expect(revalidate.query).toBeUndefined();
+  revalidate.reply(latest);
+  await page(2, "first");
+  expect(await second).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["original turn", "first", "second", "third", "summary"]);
+});
+
+test("a brief transport timeout keeps verified history and recovers without the old overlay", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  const latest = snap({ before: 1, state: "working", items: [row("new:0", "current")], live: [row("live:r:0", "old stream")] });
+  await pull(latest);
+  const view = reader.piView;
+  const pending = reader.earlier(view);
+  take("page").reply(snap({ items: [row("old:0", "earlier")] }));
+  expect(await pending).toBeTrue();
+  expect(await pull({ ok: false, error: "timeout" })).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["earlier", "current"]);
+  const retry = reader.pull();
+  const request = take("snapshot");
+  expect(request.query).toBeUndefined();
+  request.reply({ ...latest, state: "idle", live: [] });
+  expect(await retry).toBeTrue();
+  expect(reader.piView).toBe(view);
+  expect(texts(reader)).toEqual(["earlier", "current"]);
+});
+
+test("an explicitly expired snapshot cursor retries without a cursor", async () => {
+  const { reader, take, pull } = rig();
+  await reader.locate(terminal);
+  await pull(snap({ state: "working", live: [row("live:old:0", "old overlay")] }));
+  const pending = reader.pull();
+  take("snapshot").reply({ ok: false, error: "stale_revision" });
+  // Wait for the retry or the original request to settle, whichever comes first.
+  await Promise.race([pending, Bun.sleep(0)]);
+  const fresh = take("snapshot");
+  expect(fresh.query).toBeUndefined();
+  fresh.reply(snap({ session: "another-session", items: [row("new:0", "new history")] }));
+  expect(await pending).toBeTrue();
+  expect(texts(reader)).toEqual(["new history"]);
 });

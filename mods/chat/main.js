@@ -641,15 +641,19 @@ export default class Chat extends View {
     cx.timer.after(400, (cx) => { if (Date.now() - this.saveAt >= 380) cx.spawn(async () => this.saveDraft()); });
   }
 
-  async saveDraft() {
+  saveDraft() {
     const d = { text: this.box.value(), files: this.files, quote: this.quote, queue: this.queue };
     this.markTyping(!!(d.text.trim() || d.files.length || d.quote));
     const empty = !d.text.trim() && !d.files.length && !d.quote && !d.queue.length;
-    try {
-      if (empty) { if (await fs.exists(this.draftFile)) await fs.unlink(this.draftFile); return; }
+    const draft = empty ? null : JSON.stringify(d);
+    const file = this.draftFile;
+    const save = (this.draftSave ?? Promise.resolve()).then(async () => {
+      if (draft === null) { if (await fs.exists(file)) await fs.unlink(file); return; }
       await fs.mkdir(`${appHome()}/data/chat-drafts`, { recursive: true });
-      await fs.writeFile(this.draftFile, JSON.stringify(d));
-    } catch {}
+      await fs.writeFile(file, draft);
+    }).catch(() => {});
+    this.draftSave = save;
+    return save;
   }
 
   // While the box holds unsent words, its agent's terminal says so (herdr.typing=<ms>, again each
@@ -1118,14 +1122,31 @@ export default class Chat extends View {
   // agent started in the same terminal writes another file.
   async locate(cx) {
     if (this.swapping) return;
-    const r = await hc(["get", this.addr, "--json"]);
+    const addr = this.addr;
+    const r = await hc(["get", addr, "--json"]);
+    if (this.addr !== addr || this.swapping) return;
     let t = null;
     try { t = JSON.parse(r.stdout || "null"); } catch {}
     // Gone for good (removed after a restart from here), or unreachable for now (another
     // machine offline: try again later, don't call it ended).
     const gone = /not_found|no terminal/.test(`${r.stdout}\n${r.stderr}`);
-    if (!gone && (!t || t.error)) return;
-    if (gone || t?.state !== "live") {
+    if (!gone && (!t || t.error)) {
+      await this.piReader?.locate({ state: "live" });
+      return;
+    }
+    const kind = kindOf(t);
+    const exited = gone || t?.state !== "live";
+    // An empty foreground report can be a reconnect. A known shell, other agent, or terminal
+    // exit retires the reader and saves confirmed non-sends before we leave this conversation.
+    const foregroundKnown = t?.foreground?.name || t?.foreground?.pid;
+    if (this.piReader && (exited || (kind !== "pi" && (kind || foregroundKnown)))) {
+      this.piReader = null; // Fence prepared sends before any awaits or window closure.
+      const inFlight = this.pending.filter((p) => p.piDispatched && p.piSendDone).map((p) => p.piSendDone);
+      if (this.recoverPiOutgoing(null, cx, true)) await this.saveDraft();
+      await Promise.allSettled(inFlight);
+      if (this.addr !== addr || this.swapping) return;
+    }
+    if (exited) {
       // Restarted from here (perhaps before Herdr restarted): the new agent carries the origin.
       const next = terminals().find((x) => x.state === "live" && x.address !== this.addr && x.labels?.["herdr.chat.origin"] === this.originKey);
       if (next) { this.follow_to(next.address); return; }
@@ -1144,6 +1165,7 @@ export default class Chat extends View {
       this.set("ended", cx);
       return;
     }
+    if (this.piReader && (kind !== "pi" || t.foreground?.pid !== this.piReader.pid)) this.piReader.refreshPi();
     // Parked behind this chat, the terminal lost core keep (terminal.park turns it off): turn it
     // back on, so the agent survives a lost core like any pane's terminal.
     // A thread only shows a task worker, which has no pane by design: its keep is Herdr's.
@@ -1154,7 +1176,10 @@ export default class Chat extends View {
     const pane = this.lastPane ?? (this.slot && this.slotRec()?.pane) ?? null;
     if (!this.thread && !this.inner && !this.swapping && !t.labels?.["herdr.chat"] && pane && !panes().some((p) => p.terminal === this.addr)
       && panes().some((p) => p.pane === pane && p.mod === "chat")) await hc(["label", this.addr, `herdr.chat=${chatLabel(pane)}`]);
-    const kind = kindOf(t);
+    if (!kind && this.piReader?.addr === this.addr && t.state === "live" && !t.foreground?.name && !t.foreground?.pid) {
+      await this.piReader.locate(t);
+      return;
+    }
     // Back at its shell because the session it resumed is gone: a new agent starts there.
     if (!kind) {
       this.piReader = null;
@@ -1173,7 +1198,7 @@ export default class Chat extends View {
       return;
     }
     this.piReader = null;
-    if (this.kind === "pi") { this.recoverPiOutgoing(null, cx); this.kind = null; this.reset(); this.set("finding", cx); }
+    if (this.kind === "pi") { this.kind = null; this.reset(); this.set("finding", cx); }
     this.loadFirst(cx, t.labels);
     this.argv = t.foreground?.argv ?? t.argv ?? null;
     const pid = t.foreground?.pid;
@@ -1245,7 +1270,8 @@ export default class Chat extends View {
     for (const u of users) if (this.own?.has(u.id)) delete u.from;
     if (!this.pending?.length) return;
     const matches = (u, p) => (u.at ?? 0) >= p.at - 5000 && (p.piPrior
-      ? p.piBody !== undefined && !p.piPrior.has(u.id) && u.piBody === p.piBody
+      ? p.msg?.piAddr === this.addr && samePiHistory(p.msg.pi, this.piReader?.pi)
+        && p.piBody !== undefined && !p.piPrior.has(u.id) && u.piBody === p.piBody
       : same(u.text, p.sent) || (p.match && norm(u.text).includes(p.match)) || (!p.match && u.images));
     for (const id of ownWords(users, this.pending, matches)) {
       (this.own ??= new Set()).add(id);
@@ -1262,20 +1288,27 @@ export default class Chat extends View {
     for (const p of this.pending) if (p.piPrior) for (const id of consumed) p.piPrior.add(id);
   }
 
-  // Unlike a dropped socket, a different Pi history can't acknowledge the old sends. Keep the
-  // person's words and files as a draft, without their old quote and without sending anything.
-  recoverPiOutgoing(snapshot, cx) {
+  // A different Pi history can't acknowledge the old sends. Restore only confirmed unsent words
+  // and files, without the old quote. A dispatched send may already have reached Pi.
+  recoverPiOutgoing(snapshot, cx, leavingPi = false) {
     const history = piHistoryOf(snapshot);
     this.quote = piQuoteFor(this.quote, snapshot);
     this.piHistory = history;
     const belongs = (msg) => !msg?.piAddr || (msg.piAddr === this.addr && samePiHistory(msg.pi, snapshot));
-    const missed = [...this.pending.filter((p) => !belongs(p.msg)).map((p) => p.msg), ...this.queue.filter((m) => !belongs(m))];
-    if (!missed.length) return;
-    this.pending = this.pending.filter((p) => belongs(p.msg));
+    const pending = new Set(this.pending.filter((p) => !belongs(p.msg) && !p.piDispatched && !p.delivered && !p.ambiguous));
+    const missed = [...Array.from(pending, (p) => p.msg), ...this.queue.filter((m) => !belongs(m))];
+    if (!missed.length) return false;
+    this.pending = this.pending.filter((p) => !pending.has(p));
     this.queue = this.queue.filter(belongs);
-    this.box.set_value([this.box.value(), ...missed.map((m) => m.text)].filter(Boolean).join("\n\n"));
-    this.files = [...this.files, ...missed.flatMap((m) => m.files ?? [])];
-    this.note = { id: `pi-draft-${Date.now()}`, text: "Pi changed conversations. Check the terminal before sending the restored draft." };
+    this.restorePiDraft(missed, cx, leavingPi ? "Pi stopped before sending. The unsent words are back in the draft."
+      : "Pi changed conversations. Check the terminal before sending the restored draft.");
+    return true;
+  }
+
+  restorePiDraft(messages, cx, text) {
+    this.box.set_value([this.box.value(), ...messages.map((m) => m.text)].filter(Boolean).join("\n\n"));
+    this.files = [...this.files, ...messages.flatMap((m) => m.files ?? [])];
+    this.note = { id: `pi-draft-${Date.now()}`, text };
     this.saveSoon(cx);
   }
 
@@ -1284,10 +1317,13 @@ export default class Chat extends View {
     if (this.kind === "pi" && this.piReader?.addr === this.addr) {
       const reader = this.piReader;
       if (!await reader.pull() || this.piReader !== reader || this.addr !== reader.addr) return;
+      if (this.piBarrier !== reader.piBarrier) {
+        this.piBarrier = reader.piBarrier;
+        this.results.clear();
+      }
       if (this.piView !== reader.piView) {
         this.piView = reader.piView;
         this.opened.clear();
-        this.results.clear();
         this.loadingEarlier = false;
         this.piEarlier = null;
         this.anchor = null;
@@ -1295,11 +1331,7 @@ export default class Chat extends View {
       }
       if (reader.pi) this.recoverPiOutgoing(reader.pi, cx);
       this.conv = reader.conv;
-      if (this.anchor) {
-        const id = this.anchor.id;
-        const final = this.conv?.items.find((x) => x.renderId && (x.renderId === id || id.startsWith(`${x.renderId}:`)));
-        if (final) this.anchor.id = final.id + id.slice(final.renderId.length);
-      }
+      if (this.anchor) this.anchor.id = reader.piAnchor(this.anchor.id);
       this.start = reader.start;
       this.settlePending();
       this.phase = reader.pi ? "ready" : "pi-unavailable";
@@ -1368,7 +1400,7 @@ export default class Chat extends View {
     cx.spawn(async (cx) => {
       try {
         if (reader) {
-          if (!await reader.earlier(view) || this.piReader !== reader || this.piView !== view || this.addr !== reader.addr) return;
+          if (!await reader.earlier(view) || this.piReader !== reader || reader.piView !== view || this.addr !== reader.addr) return;
           this.start = reader.start;
           this.conv = reader.conv;
           this.settlePending();
@@ -1380,7 +1412,7 @@ export default class Chat extends View {
           this.records = [...recs, ...this.records];
           this.rebuild();
         }
-        this.anchor = first ? { id: first, until: Date.now() + 3000 } : null;
+        this.anchor = first ? { id: reader ? reader.piAnchor(first) : first, until: Date.now() + 3000 } : null;
         this.reanchor = true;
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -1400,12 +1432,12 @@ export default class Chat extends View {
     for (const k of this.results.keys()) { if (this.results.size <= KEEP) break; this.results.delete(k); }
     const offs = [...new Set(want.map((s) => s.out))].slice(0, 40);
     const path = this.path;
-    const view = reader?.piView;
+    const barrier = reader?.piBarrier;
     cx.spawn(async (cx) => {
       try {
         if (reader) {
           const contents = await reader.results(want);
-          if (this.piReader !== reader || this.piView !== view || this.addr !== reader.addr) return;
+          if (this.piReader !== reader || reader.piBarrier !== barrier || this.addr !== reader.addr) return;
           for (const s of want) {
             if (contents.has(s.id)) this.results.set(s.id, contents.get(s.id));
             else this.results.delete(s.id);
@@ -1437,7 +1469,7 @@ export default class Chat extends View {
           // A Coordinator tab's chat stays: empty again, ready to start the next one. One that ended before it ever
           // ran (its CLI not found on another machine, GitHub #839) says why, and the message goes back in the box.
           if (this.role) {
-            const lost = !this.path ? this.pending.filter((p) => p.msg || p.text) : [];
+            const lost = !this.path ? this.pending.filter((p) => !p.piPrior && (p.msg || p.text)) : [];
             const why = lost.length ? await this.endedWhy(this.addr) : "";
             this.startFresh();
             if (lost.length) {
@@ -1492,7 +1524,7 @@ export default class Chat extends View {
   // Enter: now (while the agent works, it takes it mid-turn). Ctrl+Enter while it
   // works: held, and sent by itself once it is free.
   send(cx, hold = false) {
-    if (this.kind === "pi" && (this.phase !== "ready" || (!hold && this.status() === "blocked"))) return;
+    if (this.kind === "pi" && (this.phase !== "ready" || !this.piReader?.pi || this.piReader.piFresh || (!hold && this.status() === "blocked"))) return;
     // A picked "#space" goes as its mention, which names its target (core/mentions.js).
     const text = mentions.expandTasks(mentions.expand(this.box.value().trim(), this.picked), this.pickedTasks);
     this.picked = [];
@@ -1540,7 +1572,7 @@ export default class Chat extends View {
 
   // A held message goes once the agent stops working (and isn't asking something).
   drainQueue(cx) {
-    if (!this.queue.length || this.phase !== "ready") return;
+    if (!this.queue.length || this.phase !== "ready" || (this.kind === "pi" && (!this.piReader?.pi || this.piReader.piFresh))) return;
     const st = this.status();
     if (st === "working" || st === "blocked" || (this.kind !== "pi" && (this.asks.length || openCard(this.addr))) || this.pending.some((p) => !p.failed && !p.late)) return;
     const msg = this.queue.shift();
@@ -1576,10 +1608,24 @@ export default class Chat extends View {
       match: norm(msg.text).slice(0, 60) || null, msg };
     if (kind === "pi") p.piPrior = new Set();
     this.pending.push(p);
-    const isSamePi = () => this.kind === "pi" && addr === msg.piAddr && this.addr === addr && this.piReader?.pid === msg.pi?.pid
-      && samePiHistory(msg.pi, this.piReader?.pi);
+    const reader = this.piReader, barrier = reader?.piBarrier;
+    const isSamePi = () => this.kind === "pi" && this.phase === "ready" && addr === msg.piAddr && this.addr === addr && this.piReader === reader
+      && !reader?.piFresh && reader?.piBarrier === barrier && reader?.pid === msg.pi?.pid && samePiHistory(msg.pi, reader?.pi);
+    const beforeDispatch = () => {
+      if (!isSamePi()) return false;
+      p.piDispatched = true;
+      return true;
+    };
+    const restoreUnsent = async () => {
+      if (!this.pending.includes(p)) return; // Already restored on a change or terminal exit.
+      this.pending = this.pending.filter((x) => x !== p);
+      this.restorePiDraft([msg], cx, "Pi did not send the message. The unsent words are back in the draft.");
+      await this.saveDraft();
+      cx.notify();
+    };
     if (kind === "pi" && (!wasPi || !msg.pi || !isSamePi())) {
-      p.failed = wasPi && !msg.pi ? PI_UNAVAILABLE : "The terminal changed before this message could be sent. Open it before writing a new message.";
+      if (wasPi) { cx.spawn(restoreUnsent); return; }
+      p.failed = "The terminal changed before this message could be sent. Open it before writing a new message.";
       p.noRetry = true;
       cx.notify();
       return;
@@ -1599,9 +1645,21 @@ export default class Chat extends View {
         // last time gets only its Enter now, never typed twice)
         const io = this.sendIo(cx);
         io.pi = (value) => isSamePi()
-          ? piSend((...a) => this.piExec(...a), addr, msg.pi, msg.id, value, msg.hold ? "hold" : "now")
-          : { code: 1, stderr: "Pi is no longer running in this terminal.", noRetry: true };
-        r = await sendTyped(io, addr, kind, p.sent, SETTLE, !!msg.stuck);
+          ? piSend((...a) => this.piExec(...a, beforeDispatch), addr, msg.pi, msg.id, value, msg.hold ? "hold" : "now")
+          : { code: 1, canceled: true };
+        const send = sendTyped(io, addr, kind, p.sent, SETTLE, !!msg.stuck);
+        if (kind === "pi") {
+          p.piSendDone = send.then(async (result) => {
+            const notDispatched = result.code !== 0 && !p.piDispatched;
+            const unsent = result.waiting || (result.code !== 0 && !result.ambiguous);
+            if (result.canceled || notDispatched || (unsent && !isSamePi())) { await restoreUnsent(); return null; }
+            if (unsent) p.piDispatched = false;
+            return result;
+          }).finally(() => { p.piSendDone = null; });
+        }
+        r = await (p.piSendDone ?? send);
+        if (!r) return;
+        if (r.waiting && !isSamePi()) { await restoreUnsent(); return; }
         if (r.waiting) {
           if (!this.pending.includes(p)) return; // a new Pi history already put the text back in the draft
           this.pending = this.pending.filter((x) => x !== p);
@@ -1615,6 +1673,7 @@ export default class Chat extends View {
         // here): the words answer it the "Reply instead…" way.
         if (r.code !== 0 && refusal(r).kind === "blocked" && (kind === "claude" || kind === "codex")) r = await this.replyInstead(p.sent, cx);
       } catch (e) {
+        if (kind === "pi" && !p.piDispatched) { await restoreUnsent(); return; }
         r = { code: 1, stderr: String(e?.message ?? e) };
       }
       // Kept as a bubble that sends again when pressed (clickRow), so nothing is lost.
@@ -1663,14 +1722,17 @@ export default class Chat extends View {
     return last ? `It said: ${last.slice(0, 200)}` : "";
   }
 
-  async piExec(script, args, on, input) {
+  async piExec(script, args, on, input, current) {
     // Herdr's exec has no stdin. Keep the prompt out of argv and off disk on the agent's machine.
     const tmp = await exec("mktemp", ["-d", "/tmp/shepherdr-pi-send.XXXXXXXX"]);
     if (tmp.code !== 0) throw new Error("Can't prepare Pi message.");
     const dir = tmp.stdout.trim(), file = `${dir}/message`;
     try {
       await writeTextFile(file, input, null);
-      const local = 'f=$1; shift; exec "$@" < "$f"';
+      // The foreground can become unverified while preparing the stdin file.
+      if (current && !current()) return { code: 1, stdout: '{"ok":false,"error":"stale_view"}' };
+      // If the local redirection fails, exec never runs. Only that path reports a definite non-send.
+      const local = `f=$1; shift; if { exec "$@"; } < "$f"; then exit 0; fi; printf '%s\\n' '{"ok":false,"error":"stdin_unavailable"}'; exit 1`;
       const cmd = ["sh", "-c", script, ...args];
       return await exec("sh", ["-c", local, "pi-chat", file, ...(on ? ["hc", "exec", "--on", on, "--stdin", "--timeout", "10", "--", ...cmd] : cmd)], { timeout: 15 });
     } finally {
@@ -1680,7 +1742,7 @@ export default class Chat extends View {
   }
 
   retry(p, cx) {
-    if (p.noRetry || p.ambiguous) return;
+    if (p.noRetry || p.ambiguous || (this.kind === "pi" && (this.phase !== "ready" || !this.piReader?.pi || this.piReader.piFresh))) return;
     this.pending = this.pending.filter((x) => x !== p);
     this.deliver(p.msg, cx);
   }
@@ -1711,7 +1773,7 @@ export default class Chat extends View {
 
   // A held message sent at once (the agent takes it mid-turn).
   sendQueued(msg, cx) {
-    if (this.kind === "pi" && this.status() === "blocked") return;
+    if (this.kind === "pi" && (this.phase !== "ready" || !this.piReader?.pi || this.piReader.piFresh || this.status() === "blocked")) return;
     this.queue = this.queue.filter((m) => m !== msg);
     if (msg.raw && this.kind !== "pi") personHc(["send", this.addr, msg.text]);
     else this.deliver({ ...msg, hold: false }, cx);
@@ -1739,7 +1801,10 @@ export default class Chat extends View {
 
   // Up in an empty box (or one showing a recalled message): the previous message again.
   recallStep(dir) {
-    const mine = [...(this.conv?.items ?? []).filter((x) => x.kind === "user" && x.text && !x.from).map((x) => x.text), ...this.pending.map((p) => p.text)];
+    // Pi's persisted user rows are the recall history. A pending send may already have reached
+    // Pi, and recalling it would bypass the no-Retry guard by creating a new request.
+    const mine = [...(this.conv?.items ?? []).filter((x) => x.kind === "user" && x.text && !x.from).map((x) => x.text),
+      ...this.pending.filter((p) => !p.piPrior).map((p) => p.text)];
     const list = [...new Set(mine.reverse())];
     if (!list.length) return false;
     const next = this.recall + dir;

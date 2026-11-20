@@ -5,7 +5,7 @@
 // Shared core: the source is core/chat-reader.js.
 
 import { FIND, LOG, Conversation, records, resultText, piConversation } from "./chat-log.js";
-import { piSnapshot, piPage, piResults, samePiHistory } from "./pi-chat.js";
+import { piSnapshot, piPage, piResults, samePiHistory, piCanKeepWindow, piPageEndsAt } from "./pi-chat.js";
 import { BgJobs } from "./bg-jobs.js";
 
 export const PAGE = 200;
@@ -35,6 +35,9 @@ export class ChatReader {
     this.piEnd = null;
     this.piView = null;
     this.piFresh = true;
+    this.piOffline = false;
+    this.piIdentityUnknown = false;
+    this.piGap = null;
     this.piBarrier = {};
     this.piReadSeq = 0;
     this.start = null;   // the first byte read (0: the log's very start)
@@ -62,7 +65,15 @@ export class ChatReader {
     if (this.pinned) return false;
     const kind = kindOf(t);
     const pid = t?.foreground?.pid;
-    if (kind === "pi" && t?.state !== "ended") {
+    if (this.kind === "pi" && this.pid && t?.state === "live" && !pid && (kind === "pi" || !t.foreground?.name)) {
+      // A reconnect can remove the foreground record before hc get fills it back in.
+      // Do not poll the old PID or throw away its window while identity is unknown.
+      if (!this.piIdentityUnknown) this.refreshPi();
+      this.piIdentityUnknown = true;
+      return false;
+    }
+    this.piIdentityUnknown = false;
+    if (kind === "pi" && t?.state !== "ended" && t?.state !== "finished") {
       if (this.kind === "pi" && this.pid === pid) return false;
       this.reset();
       this.kind = kind;
@@ -122,42 +133,106 @@ export class ChatReader {
 
   refreshPi() {
     this.piFresh = true;
+    this.piOffline = false;
     this.piBarrier = {};
+    // The loaded rows and any gap pages are already verified under this.pi's generation.
+    // A transport failure does not invalidate them; a new history will discard them.
+  }
+
+  suspendPi() {
+    if (!this.pi || this.piOffline) return false;
+    this.refreshPi();
+    this.piOffline = true;
+    this.pi = { ...this.pi, live: [] };
+    this.rebuildPi();
+    return true;
   }
 
   rebuildPi() {
-    const live = (this.pi.live ?? []).map((x) => ({ ...x, provisional: true }));
-    this.conv = piConversation([...this.piItems, ...live], this.pi);
+    const live = this.pi.state === "working" || this.pi.state === "blocked" ? this.pi.live ?? [] : [];
+    this.conv = piConversation([...this.piItems, ...live.map((x) => ({ ...x, provisional: true }))], this.pi);
+  }
+
+  piAnchor(id) {
+    const final = id && this.conv?.items.find((x) => x.renderId && (x.renderId === id || id.startsWith(`${x.renderId}:`)));
+    return final ? final.id + id.slice(final.renderId.length) : id;
+  }
+
+  // A page/result can discover navigation before the next poll does. Fence all in-flight
+  // requests, including snapshots taken before that reply, and revalidate from scratch.
+  acceptsPiReply(reply, barrier) {
+    if (barrier !== this.piBarrier || !reply) return false;
+    if (samePiHistory(this.pi, reply)) return true;
+    this.refreshPi();
+    return false;
   }
 
   async pullPi() {
+    if (this.piIdentityUnknown) return this.suspendPi();
     const barrier = this.piBarrier, seq = ++this.piReadSeq;
+    const current = () => this.piBarrier === barrier && this.piReadSeq === seq;
     const previous = this.piFresh ? null : this.pi;
-    const next = await piSnapshot(this.io.sh, this.addr, this.pid, previous);
-    if (this.piBarrier !== barrier || this.piReadSeq !== seq) return false;
+    const validDelta = (s) => samePiHistory(previous, s) && s.before === this.piEnd;
+    let next = await piSnapshot(this.io.sh, this.addr, this.pid, previous, true);
+    if (!current()) return false;
+    if (next?.error === "transport" && this.pi) return this.suspendPi();
+    if (previous && (next?.error === "stale_revision" || (next?.reset === false && !validDelta(next)))) {
+      this.refreshPi();
+      return this.pullPi();
+    }
+    if (next?.error || (next?.generation && next.reset === false && !previous)) next = null;
     if (!next) {
       if (this.state === "unavailable") return false;
       this.refreshPi();
-      this.pi = this.piView = this.piVersion = this.piEnd = this.start = this.conv = null;
+      this.pi = this.piView = this.piVersion = this.piEnd = this.piGap = this.start = this.conv = null;
       this.piItems = [];
       this.state = "unavailable";
       return true;
     }
-    const replace = !samePiHistory(previous, next) || next.reset !== false;
+    const snapshot = !next.generation || next.reset !== false;
+    if (snapshot && this.piItems.length && next.generation && samePiHistory(this.pi, next) && next.before > this.piEnd) {
+      // Page backwards from a fixed target, even if the tail keeps growing. Bound the work
+      // per poll without throwing away the anchor or repeatedly copying the backlog.
+      const gap = this.piGap ?? { target: next, before: next.before, pages: [] };
+      for (let remaining = 2; remaining > 0 && gap.before > this.piEnd; remaining--) {
+        const page = await piPage(this.io.sh, this.addr, this.pid, next.generation, gap.before);
+        if (!current() || (page && !this.acceptsPiReply(page, barrier))) return false;
+        if (!piPageEndsAt(page, gap.before)) break;
+        gap.pages.push(page.items);
+        gap.before = page.before;
+      }
+      if (gap.before > this.piEnd) {
+        this.piGap = gap;
+        // Only the state is current while a gap separates these rows from the live tail.
+        const changed = this.piFresh || this.pi.state !== next.state || !!this.pi.live?.length;
+        this.pi = { ...this.pi, state: next.state, live: [] };
+        this.piFresh = this.piOffline = false;
+        if (changed) this.rebuildPi();
+        return changed;
+      }
+      next = { ...gap.target, before: gap.before, items: [...gap.pages.reverse().flat(), ...gap.target.items],
+        state: next.state, live: gap.target.leaf === next.leaf ? next.live : [] };
+    }
+    this.piGap = null;
     const version = JSON.stringify([next.instance, next.session, next.leaf, next.generation, next.state, next.live]);
     if (next.generation) {
-      // A newer bridge signals append or replacement explicitly. Never splice a delta from a different history.
-      if (next.reset === false && (replace || next.before !== this.piEnd)) { this.refreshPi(); return false; }
-      if (!replace && !next.items.length && version === this.piVersion) return false;
+      if (!snapshot && !next.items.length && version === this.piVersion) return false;
     } else if (JSON.stringify(next) === this.piVersion && !this.piFresh) return false;
-    if (replace) {
-      this.piBarrier = {};
-      this.piView = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      this.piItems = next.items;
-      this.start = next.before ?? null;
+    if (snapshot) {
+      const keep = piCanKeepWindow(this.pi, this.start, this.piEnd, this.piItems, next);
+      if (keep) {
+        const prefix = this.piItems.slice(0, Math.max(0, next.before - this.start));
+        this.piItems = [...prefix, ...next.items];
+        this.start = next.before - prefix.length;
+      } else {
+        this.piBarrier = {};
+        this.piView = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        this.piItems = next.items;
+        this.start = next.before ?? null;
+      }
     } else if (next.items.length) this.piItems.push(...next.items);
     this.piEnd = next.generation ? next.before + next.items.length : null;
-    this.piFresh = false;
+    this.piFresh = this.piOffline = false;
     this.piVersion = next.generation ? version : JSON.stringify(next);
     this.pi = next;
     this.state = "ready";
@@ -213,9 +288,7 @@ export class ChatReader {
       const { generation } = this.pi, barrier = this.piBarrier;
       const ids = [...new Set(want.map((s) => s.out))].slice(0, 10);
       const r = await piResults(this.io.sh, this.addr, this.pid, generation, ids);
-      if (barrier !== this.piBarrier) return out;
-      if (r?.error === "stale_revision") this.refreshPi();
-      if (!samePiHistory(this.pi, r) || !Array.isArray(r.outputs)) return out;
+      if (!this.acceptsPiReply(r, barrier) || !Array.isArray(r.outputs)) return out;
       for (const x of r.outputs) for (const s of want) if (x.id === s.out) out.set(s.id, x.text);
       return out;
     }
@@ -238,9 +311,8 @@ export class ChatReader {
       if (this.piFresh || !this.start || !this.pi?.generation || (view !== undefined && view !== this.piView)) return false;
       const { generation } = this.pi, before = this.start, barrier = this.piBarrier;
       const r = await piPage(this.io.sh, this.addr, this.pid, generation, before);
-      if (barrier !== this.piBarrier || this.start !== before) return false;
-      if (r?.error === "stale_revision") this.refreshPi();
-      if (!samePiHistory(this.pi, r) || !Array.isArray(r.items) || !(r.before >= 0 && r.before < before)) return false;
+      if (!this.acceptsPiReply(r, barrier) || this.start !== before) return false;
+      if (!piPageEndsAt(r, before)) return false;
       this.start = r.before;
       this.piItems = [...r.items, ...this.piItems];
       this.rebuildPi();

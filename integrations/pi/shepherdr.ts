@@ -59,7 +59,7 @@ function cleanText(value: string, limit = value.length) {
 type Entry = ReturnType<ExtensionContext["sessionManager"]["getBranch"]>[number];
 type ChatMessage = Extract<Entry, { type: "message" }>["message"];
 type Assistant = Extract<ChatMessage, { role: "assistant" }>;
-type Row = { id: string; role: "user" | "assistant" | "custom" | "compaction" | "branch" | "tool" | "result";
+type Row = { id: string; role: "user" | "assistant" | "custom" | "compaction" | "branch" | "context-edit" | "tool" | "result";
   text: string; at: number; part?: number; from?: string };
 
 // Index the raw branch, not Pi's model projection: compaction and context edits must not erase chat.
@@ -98,16 +98,22 @@ function indexBranch(branch: Entry[]) {
     };
     if (e.type === "message") {
       const m = e.message;
-      if (m.role === "user" || m.role === "assistant") {
+      if (m?.role === "user" || m?.role === "assistant") {
         failed = m.role === "assistant" && m.stopReason === "error";
         content(m.role, m.content);
-      } else if (m.role === "toolResult") {
+      } else if (m?.role === "toolResult") {
         const id = calls.get(m.toolCallId);
-        if (id) { results.set(id, m); row(0, "result", id); }
-      }
+        if (id) {
+          calls.delete(m.toolCallId);
+          results.set(id, m);
+          row(0, "result", id);
+        }
+      } else if (m?.role === "custom" && m.display === true) content("custom", m.content);
     } else if (e.type === "custom_message" && e.display === true) content("custom", e.content);
     else if (e.type === "compaction") row(0, "compaction", e.summary);
     else if (e.type === "branch_summary") row(0, "branch", e.summary);
+    // The replacement is model-only (and could contain private text). Keep the original row.
+    else if (e.type === "context_edit") row(0, "context-edit", "Earlier content changed in Pi’s context. The chat is unchanged.");
     positions.set(e.id, rows.length);
   }
   return { rows, positions, results, failed };
@@ -142,7 +148,7 @@ function fileMark(path: string | undefined, old?: ReturnType<typeof fileStamp>) 
   } catch { return { stamp: undefined, replaced: Boolean(old) }; }
 }
 
-function fileStamp(path: string, old?: { identity: string; size: number; changed: bigint; tail: Buffer }) {
+function fileStamp(path: string, old?: { identity: string; size: number; changed: bigint; digest: string }) {
   const info = statSync(path, { bigint: true });
   if (!info.isFile()) throw new Error("Not a session file");
   const identity = `${info.dev}:${info.ino}:${info.birthtimeNs}`;
@@ -152,15 +158,29 @@ function fileStamp(path: string, old?: { identity: string; size: number; changed
   const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
     const opened = fstatSync(fd, { bigint: true });
-    if (`${opened.dev}:${opened.ino}:${opened.birthtimeNs}` !== identity || !opened.isFile()) throw new Error("Session file changed");
-    const tail = Buffer.alloc(Math.min(size, 128));
-    readSync(fd, tail, 0, tail.length, size - tail.length);
+    if (`${opened.dev}:${opened.ino}:${opened.birthtimeNs}` !== identity || !opened.isFile() || opened.size !== info.size
+        || opened.ctimeNs !== changed) throw new Error("Session file changed");
+    // Unchanged metadata never needs a read. On growth, verify every old byte: a truncate
+    // and rewrite can grow the same inode and preserve both ends of the former file.
+    const hash = createHash("sha256"), buf = Buffer.allocUnsafe(64 * 1024);
+    let offset = 0;
+    const hashThrough = (end: number) => {
+      while (offset < end) {
+        const count = readSync(fd, buf, 0, Math.min(buf.length, end - offset), offset);
+        if (!count) throw new Error("Session file truncated");
+        hash.update(buf.subarray(0, count));
+        offset += count;
+      }
+    };
     let append = false;
     if (old && identity === old.identity && size > old.size) {
-      const prior = Buffer.alloc(old.tail.length);
-      append = readSync(fd, prior, 0, prior.length, old.size - prior.length) === prior.length && prior.equals(old.tail);
+      hashThrough(old.size);
+      append = hash.copy().digest("hex") === old.digest;
     }
-    return { identity, size, changed, tail, append };
+    hashThrough(size);
+    const verify = fstatSync(fd, { bigint: true });
+    if (verify.size !== info.size || verify.ctimeNs !== changed) throw new Error("Session file changed");
+    return { identity, size, changed, digest: hash.digest("hex"), append };
   } finally { closeSync(fd); }
 }
 
@@ -171,13 +191,12 @@ export default function (pi: ExtensionAPI) {
   let observe: (() => void) | undefined;
   type Stream = { id: string; manager: ExtensionContext["sessionManager"]; session: string; leaf: string | null };
   let live: (Stream & { message: Assistant }) | undefined;
-  let ended: Stream[] = [];
-  const clearLive = () => { live = undefined; ended = []; };
+  const clearLive = () => { live = undefined; };
   const finishLive = () => {
-    if (!live) return;
-    const { id, manager, session, leaf } = live;
-    ended = [...ended.slice(-19), { id, manager, session, leaf }];
-    live = undefined;
+    // Pi has persisted the final by turn_end. Observe it even if no client polled
+    // during the turn, before releasing the stream's identity for the next one.
+    if (live) observe?.();
+    clearLive();
   };
   pi.on("ui_prompt_start", () => { blocked = true; });
   pi.on("ui_prompt_end", () => { blocked = false; });
@@ -187,15 +206,16 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_tree", () => { observe?.(); });
   pi.on("message_start", ({ message }, ctx) => {
     if (message.role !== "assistant") return;
-    finishLive();
+    // Sample before creating the overlay. A switch already made by Pi should
+    // invalidate the old stream, not the first stream in the new conversation.
+    observe?.();
     live = { id: randomUUID(), manager: ctx.sessionManager,
       session: ctx.sessionManager.getSessionId(), leaf: ctx.sessionManager.getLeafId() ?? null, message };
   });
   pi.on("message_update", ({ message }, ctx) => {
     if (message.role !== "assistant") return;
-    if (live?.manager === ctx.sessionManager) live.message = message;
-    else live = { id: randomUUID(), manager: ctx.sessionManager, session: ctx.sessionManager.getSessionId(),
-      leaf: ctx.sessionManager.getLeafId() ?? null, message };
+    // Late updates cannot resurrect a stream invalidated by navigation.
+    if (live?.manager === ctx.sessionManager && live.session === ctx.sessionManager.getSessionId()) live.message = message;
   });
   pi.on("turn_end", finishLive);
   pi.on("agent_end", finishLive);
@@ -213,8 +233,8 @@ export default function (pi: ExtensionAPI) {
     const temp = join(dir, `${pid}.${instance}.tmp`);
     const sockets = new Set<Socket>();
     const receipts = new Map<string, { digest: string; status: "accepted" | "queued" }>();
-    const manager = ctx.sessionManager;
     let generation = randomUUID();
+    let lastManager: ExtensionContext["sessionManager"] | undefined;
     let lastSession: string | undefined;
     let lastLeaf: string | null = null;
     let lastCount = 0;
@@ -226,16 +246,20 @@ export default function (pi: ExtensionAPI) {
     let refresh = true;
     const revision = () => { generation = randomUUID(); refresh = true; clearLive(); aliases.clear(); };
     function current(sample = false) {
+      const manager = ctx.sessionManager;
       const session = manager.getSessionId();
       const leaf = manager.getLeafId() ?? null;
       const path = manager.getSessionFile?.();
       const first = lastSession === undefined;
       const file = fileMark(path, stamp);
-      const changed = !first && (session !== lastSession || lastPath !== path || file.replaced);
+      const changed = !first && (manager !== lastManager || session !== lastSession || lastPath !== path || file.replaced
+        || (leaf !== null && leaf === lastLeaf && typeof manager.getLeafEntry === "function"
+          && (manager.getLeafEntry() ?? undefined) !== branch.at(-1)));
       stamp = file.stamp;
       if (changed) revision();
       if (refresh || leaf !== lastLeaf) {
         const entries = manager.getEntries();
+        const previousBranch = branch;
         branch = manager.getBranch();
         if (!refresh) {
           // Pi can install an existing descendant as its active leaf before session_tree handlers finish.
@@ -243,13 +267,15 @@ export default function (pi: ExtensionAPI) {
           const parent = lastLeaf === null ? -1 : branch.findIndex((e) => e.id === lastLeaf);
           const added = entries.slice(lastCount);
           const suffix = branch.slice(parent + 1);
-          if ((lastLeaf !== null && parent < 0) || !added.length || suffix.length !== added.length ||
+          if ((lastLeaf !== null && (parent < 0 || branch[parent] !== previousBranch.at(-1))) ||
+              !added.length || suffix.length !== added.length ||
               !added.every((e, i) => e.id === suffix[i].id && e.type !== "branch_summary")) revision();
         }
         index = indexBranch(branch);
         lastCount = entries.length;
         refresh = false;
       } else if (sample) lastCount = manager.getEntries().length;
+      lastManager = manager;
       lastSession = session;
       lastPath = path;
       lastLeaf = leaf;
@@ -263,16 +289,15 @@ export default function (pi: ExtensionAPI) {
         for (let i = from; i < branch.length; i++) {
           const entry = branch[i];
           if (entry.type !== "message") continue;
-          if (entry.message.role === "user") return true;
-          if (entry.message.role !== "assistant") continue;
+          if (entry.message?.role === "user") return true;
+          if (entry.message?.role !== "assistant") continue;
           aliases.set(entry.id, stream.id);
           if (aliases.size > 200) aliases.delete(aliases.keys().next().value!);
           return true;
         }
         return false;
       };
-      ended = ended.filter((stream) => !reconcile(stream));
-      if (live && reconcile(live)) live = undefined;
+      if (live && reconcile(live)) clearLive();
       return { instance, session, leaf, generation };
     }
 
@@ -295,14 +320,14 @@ export default function (pi: ExtensionAPI) {
         // An append beyond the bounded delta window expires the cursor. Return a fresh page instead.
         const result = reset ? page(index.rows, index.rows.length, 0, PAGE_BYTES, aliases) : delta;
         let overlay: Row[] = [];
-        if (live && live.manager === manager && live.session === session && (state === "working" || state === "blocked")) {
+        if (live && (state === "working" || state === "blocked")) {
           const { id, message } = live;
           if (Array.isArray(message.content)) {
-            const rows = message.content.flatMap((p, i): Row[] => p.type === "text" && p.text.trim() ?
+            const rows = message.content.flatMap((p, i): Row[] => p?.type === "text" && typeof p.text === "string" && p.text.trim() ?
               [{ id: `live:${id}:${i}`, role: "assistant", text: cleanText(p.text, 4000), at: message.timestamp }] : []);
             overlay = page(rows, rows.length, 0, LIVE_BYTES).items;
           }
-        } else finishLive();
+        } else clearLive();
         return { ok: true, ...identity, state, reset, ...result, live: overlay };
       }
       if (request.op === "page" || request.op === "results") {

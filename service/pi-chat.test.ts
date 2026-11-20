@@ -147,7 +147,7 @@ test("selecting an ordinary remote terminal discovers Pi before its chat is watc
 });
 
 test("web keeps a repeated Pi send pending until a new exact body appears", async () => {
-  const at = Date.now(), active = { ...snap, state: "working", generation: "g1" };
+  const at = Date.now(), active = { ...snap, state: "working", generation: "g1", reset: true, before: 0, live: [] };
   const old = { id: "old", role: "user", text: "continue", at: at - 10 };
   const items = [old, { id: "reply", role: "assistant", text: "still working", at }];
   let records = items;
@@ -211,7 +211,7 @@ test("web leaves Pi prompts in the terminal and reports a missing integration as
     expect(latest().messages.some((m) => m.question)).toBeFalse();
     await expect(act(h, { ...send, cid: "pi-terminal-prompt" }, compat)).rejects.toThrow("Answer in the terminal");
     expect(requests).toHaveLength(1);
-    bridge = { ok: false, error: "not_available" };
+    bridge = { ok: false, error: "unsafe_registry" };
     await until(() => latest().notice === "pi-unavailable");
     expect(latest()).toMatchObject({ cli: "pi", notice: "pi-unavailable", messages: [], working: false });
     expect(latest().blocked).toBeUndefined();
@@ -260,12 +260,13 @@ test("web publishes Pi append, earlier, branch replacement and a revalidated rec
     const details = activity(chats.reader(addr), tool.id, view);
     await until(() => finishResult);
     getSnapshot = () => ({ ...shape, generation: "other", leaf: "fork", before: 0,
-      items: [row("fork:0", "fork only"), row("notice:0", "retained history", "compaction")] });
+      items: [row("fork:0", "fork only"), row("notice:0", "retained history", "compaction"),
+        row("edit:0", "changed model context", "context-edit")] });
     await until(() => latest().piView !== view);
     finishResult?.({ ...shape, outputs: [{ id: "call:0", text: "out from old branch" }] });
     expect(await details).toHaveProperty("error");
-    expect(latest().messages.map((m) => m.text)).toEqual(["fork only", "retained history"]);
-    expect(latest().messages[1].brief?.label).toBe("Compaction summary");
+    expect(latest().messages.map((m) => m.text)).toEqual(["fork only", "retained history", "changed model context"]);
+    expect(latest().messages.slice(1).map((m) => m.brief?.label)).toEqual(["Compaction summary", "Context edit"]);
     await chats.earlier(addr, view);
     expect(queried.filter(([op]) => op === "page")).toHaveLength(1);
     chats.unwatch(addr, page);
@@ -301,9 +302,101 @@ test("a new Pi subscriber cannot receive a poll already in flight for another ta
   } finally { chats.unwatch(addr, a); chats.unwatch(addr, b); }
 });
 
+test("a core reconnect fences the old in-flight Pi overlay before publishing again", async () => {
+  const first = { ...snap, generation: "first", reset: true, before: 0, live: [] };
+  const final = { ...first, session: "switched", generation: "next", items: [
+    { id: "unique:0", role: "assistant", text: "New session", at: 44 },
+  ] };
+  const queries: unknown[] = [];
+  let delayed: ((value: unknown) => void) | undefined;
+  const { h } = remote((_op, query) => {
+    queries.push(query);
+    return queries.length === 1 ? first : queries.length === 2 ? new Promise((resolve) => { delayed = resolve; }) : final;
+  });
+  let emit: (event: { type: "reset" }) => void = () => {};
+  h.on = (cb) => { emit = cb; return () => true; };
+  const chats = new Chats(h);
+  const published: string[][] = [];
+  const page = (r: any) => published.push(r.conv.items.map((x: any) => x.text));
+  chats.watch(addr, page);
+  try {
+    await until(() => delayed);
+    expect(published).toEqual([["hi", "hello"]]);
+    emit({ type: "reset" });
+    delayed?.({ ...first, reset: false, state: "working", before: 2, items: [],
+      live: [{ id: "live:obsolete:0", role: "assistant", text: "Old overlay", at: 43 }] });
+    await until(() => published.some((words) => words.includes("New session")));
+    expect(queries[2]).toBeUndefined();
+    expect(published).toEqual([["hi", "hello"], ["New session"]]);
+  } finally { chats.unwatch(addr, page); }
+});
+
+test("a transient missing foreground after core reset keeps the verified Pi view", async () => {
+  const first = { ...snap, generation: "g1", reset: true, before: 1, live: [] };
+  const { h } = remote((op) => op === "page" ? { ...first, before: 0, items: [
+    { id: "history", role: "assistant", text: "Loaded earlier", at: 42 },
+  ] } : first);
+  const fake = join(root, "hc-missing-foreground");
+  writeFileSync(fake, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+  const saved = process.env.SHEPHERDR_HC;
+  process.env.SHEPHERDR_HC = fake;
+  let emit: (event: { type: "reset" }) => void = () => {};
+  h.on = (cb) => { emit = cb; return () => true; };
+  const chats = new Chats(h), compat = new Compat();
+  const published: ReturnType<Compat["chat"]>[] = [];
+  const page = (r: any, t: any) => published.push(compat.chat(`t:${addr}`, r, t));
+  const latest = () => published.at(-1)!;
+  chats.watch(addr, page);
+  try {
+    await until(() => published.length);
+    const view = latest().piView;
+    await chats.earlier(addr, view);
+    const reads = published.length;
+    h.terminals.set(addr, { ...live, foreground: null } as any);
+    emit({ type: "reset" });
+    await until(() => published.length > reads);
+    expect(latest()).toMatchObject({ piView: view, top: true });
+    expect(latest().messages.map((m) => m.text)).toEqual(["Loaded earlier", "hi", "hello"]);
+    const interrupted = published.length;
+    h.terminals.set(addr, live as any);
+    emit({ type: "reset" });
+    await until(() => published.length > interrupted);
+    expect(latest().piView).toBe(view);
+    expect(latest().messages.map((m) => m.text)).toEqual(["Loaded earlier", "hi", "hello"]);
+  } finally {
+    chats.unwatch(addr, page);
+    if (saved === undefined) delete process.env.SHEPHERDR_HC; else process.env.SHEPHERDR_HC = saved;
+  }
+});
+
+test("web removes an interrupted overlay without resetting the scroller or publishing to a new watcher", async () => {
+  const first = { ...snap, generation: "g1", reset: true, before: 0, state: "working",
+    live: [{ id: "live:old:0", role: "assistant", text: "Old overlay", at: 43 }] };
+  let bridge: Record<string, unknown> = first;
+  const { h } = remote(() => bridge);
+  const chats = new Chats(h), compat = new Compat();
+  const existing: ReturnType<Compat["chat"]>[] = [], joined: ReturnType<Compat["chat"]>[] = [];
+  const a = (r: any, t: any) => existing.push(compat.chat(`t:${addr}`, r, t));
+  const b = (r: any, t: any) => joined.push(compat.chat(`t:${addr}`, r, t));
+  chats.watch(addr, a);
+  try {
+    await until(() => !!existing.at(-1)?.messages.some((m) => m.provisional));
+    const view = existing.at(-1)!.piView;
+    bridge = { ok: false, error: "timeout" };
+    await until(() => existing.length > 1);
+    expect(existing.at(-1)).toMatchObject({ piView: view, working: true });
+    expect(existing.at(-1)?.messages.map((m) => m.text)).toEqual(["hi", "hello"]);
+    chats.watch(addr, b);
+    expect(joined).toHaveLength(0);
+    bridge = { ...first, state: "idle", live: [] };
+    await until(() => joined.length);
+    expect(joined[0]).toMatchObject({ piView: view, working: false });
+  } finally { chats.unwatch(addr, a); chats.unwatch(addr, b); }
+});
+
 test("a quoted web send is bound to the Pi snapshot the person saw", async () => {
-  const original = { ...snap, generation: "old", session: "previous" };
-  let active = { ...snap, generation: "new", session: "replacement" };
+  const original = { ...snap, generation: "old", session: "previous", reset: true, before: 0, live: [] };
+  let active = { ...original, generation: "new", session: "replacement" };
   const { h, compat, requests } = remote(() => active);
   compat.reader = (() => ({ kind: "pi", pi: original, conv: { items: [{ id: "old-quote", text: "only on the previous branch" }] } })) as any;
   compat.tasksFor = (() => [{ ref: "TASK-7", title: "Test task", state: "working", folder: "/repo", prompt: "task brief" }]) as any;
