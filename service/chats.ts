@@ -16,7 +16,7 @@ type Followed = { reader: ChatReader; pages: Set<Watcher>; busy: boolean; idleSi
   /** a change came while it was being read: read once more after */
   again?: boolean;
   /** Pi subscribers may only receive polls that started after they subscribed. */
-  awaiting?: Map<Watcher, { notified?: boolean }>;
+  awaiting?: Map<Watcher, object>;
   /** its terminal's watch-only stream, and a read it asked for soon */
   stream?: { close(): void } | null; soon?: ReturnType<typeof setTimeout> | null; last?: number;
   /** what its CLI said it does when last told (the working line's words while no call is open in its log) */
@@ -103,7 +103,7 @@ export class Chats {
     }
     f.pages.add(page);
     f.idleSince = null;
-    if (f.ready) this.sendToPage(addr, f, page);
+    if (f.ready && !f.awaiting?.has(page)) page(f.reader, this.hub.terminals.get(addr));
     void this.tick(addr);
   }
 
@@ -215,19 +215,7 @@ export class Chats {
     // Newly joined pages stay in `awaiting` until a snapshot has been revalidated.
     if (f.reader.kind === "pi" && f.reader.piFresh && !f.reader.piOffline && f.reader.state !== "unavailable") return;
     f.ready = true;
-    for (const page of f.pages) this.sendToPage(addr, f, page);
-  }
-
-  private sendToPage(addr: string, f: Followed, page: Watcher) {
-    const t = this.hub.terminals.get(addr), awaiting = f.awaiting?.get(page);
-    if (!awaiting) { page(f.reader, t); return; }
-    if (!f.reader.piOffline || awaiting.notified) return;
-    // A missing bridge can stay gone. Tell the new watcher why, without revealing any
-    // cached history, and keep its subscription waiting for a verified snapshot.
-    awaiting.notified = true;
-    const unavailable = new ChatReader(this.io, addr);
-    unavailable.kind = "pi";
-    unavailable.state = "unavailable";
-    page(unavailable, t);
+    const t = this.hub.terminals.get(addr);
+    for (const page of f.pages) if (!f.awaiting?.has(page)) page(f.reader, t);
   }
 }
